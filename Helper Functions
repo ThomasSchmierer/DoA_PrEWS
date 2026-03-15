@@ -1,0 +1,468 @@
+function val = getFieldOr(structVar, fieldName, defaultVal)
+    if isfield(structVar, fieldName)
+        val = structVar.(fieldName);
+    else
+        val = defaultVal;
+    end
+end
+
+function [X, BISval, TTTval, state_val] = prepareData(dataStruct, num_feats, num_bands)
+    n = length(dataStruct);
+    total_eeg_feats = num_feats * num_bands;
+    X = zeros(n, total_eeg_feats);
+    BISval    = zeros(n, 1);
+    TTTval    = zeros(n, 1);
+    state_val = zeros(n, 1);
+    for i = 1:n
+        X(i,:)       = reshape(dataStruct(i).EEG, 1, []);
+        BISval(i)    = dataStruct(i).BISMedian;
+        TTTval(i)    = dataStruct(i).time_to_target;
+        state_val(i) = str2double(dataStruct(i).state);
+    end
+end
+
+function [preselected_indices, mi_scores] = preselectFeaturesByMI(X, y, topN)
+    [numSamples, numCols] = size(X);
+    expected_total = 10 * 30;  % 10 features × 30 bands
+    if numCols ~= expected_total
+        error('X must have 300 columns (10 features x 30 bands). Found %d.', numCols);
+    end
+
+    mi_scores = zeros(numCols, 1);
+    for c = 1:numCols
+        mi_scores(c) = compute_mutual_info(X(:, c), y);
+    end
+
+    selected = [];
+    for f = 1:10
+        start_idx = (f - 1) * 30 + 1;
+        end_idx = f * 30;
+        featureCols = start_idx:end_idx;
+        [~, localIdx] = sort(mi_scores(featureCols), 'descend');
+        bestLocal = featureCols(localIdx(1));
+        selected = [selected; bestLocal];
+    end
+
+    if topN < 10
+        warning('topN=%d < 10 => returning 10 columns', topN);
+        preselected_indices = selected;
+        return;
+    end
+
+    [~, global_sort_idx] = sort(mi_scores, 'descend');
+    for iRank = 1:numCols
+        candidate = global_sort_idx(iRank);
+        if ~ismember(candidate, selected)
+            selected = [selected; candidate];
+            if numel(selected) == topN
+                break;
+            end
+        end
+    end
+
+    preselected_indices = selected;
+end
+
+function [selected_features] = performRFE(X, y, candidateFeatures, finalNum, numTrees)
+    remaining = candidateFeatures;
+    while length(remaining) > finalNum
+        rfModel = TreeBagger(numTrees, X(:, remaining), y, ...
+                             'Method','regression','OOBPredictorImportance','on');
+        importance = rfModel.OOBPermutedPredictorDeltaError;
+        [~, leastImp] = min(importance);
+        remaining(leastImp) = [];
+    end
+    selected_features = remaining;
+end
+
+function [final_features] = addRelationshipBasedFeatures(X, y, currentFeatures, numToAdd, excludeList)
+    num_features = size(X, 2);
+    relationship_scores = zeros(1, num_features);
+    for iF = 1:num_features
+        relationship_scores(iF) = compute_mutual_info(X(:, iF), y);
+    end
+    candidate_indices = setdiff(1:num_features, [currentFeatures(:); excludeList(:)]);
+    [~, sortedIdx] = sort(relationship_scores(candidate_indices), 'descend');
+    numToAdd = min(numToAdd, length(sortedIdx));
+    top_indices    = candidate_indices(sortedIdx(1:numToAdd));
+    final_features = unique([currentFeatures(:); top_indices(:)], 'stable');
+end
+
+function synthetic_samples = smote(minority_samples, num_samples_to_generate, k_neighbors)
+    num_minority = size(minority_samples,1);
+    num_features = size(minority_samples,2);
+    synthetic_samples = zeros(num_samples_to_generate, num_features);
+    if num_minority < 2
+        if num_minority == 1
+            synthetic_samples = repmat(minority_samples, num_samples_to_generate, 1);
+        end
+        return;
+    end
+    distances = pdist2(minority_samples, minority_samples);
+    for i = 1:num_samples_to_generate
+        idx = randi(num_minority);
+        [~, neigh_idx] = sort(distances(idx,:), 'ascend');
+        neighbours = neigh_idx(2:k_neighbors+1);
+        chosen_neigh = neighbours(randi(k_neighbors));
+        gap = rand(1, num_features);
+        synthetic_samples(i,:) = minority_samples(idx,:) + ...
+            gap.*(minority_samples(chosen_neigh,:) - minority_samples(idx,:));
+    end
+end
+
+function mi = compute_mutual_info(x, y)
+    Hx  = entropy_estimate(x);
+    Hy  = entropy_estimate(y);
+    Hxy = entropy_estimate([x, y]);
+    mi  = Hx + Hy - Hxy;
+end
+
+function H = entropy_estimate(data)
+    [counts, ~] = histcounts(data, 'Normalization','probability');
+    counts = counts(counts>0);
+    H = -sum(counts.*log2(counts));
+end
+
+function numLabel = regionStr2Num(strLabel)
+    uniqueLabels = ["Awake","Unconscious","Recovering"];
+    numLabel = zeros(length(strLabel),1);
+    for i = 1:length(strLabel)
+        idx = find(uniqueLabels==strLabel(i));
+        if ~isempty(idx)
+            numLabel(i) = idx;
+        else
+            numLabel(i) = 0; 
+        end
+    end
+end
+
+function F1_macro = computeMultiClassF1(confMat)
+    C = size(confMat,1);
+    f1_vals = zeros(C,1);
+    for c=1:C
+        TP = confMat(c,c);
+        FP = sum(confMat(:,c)) - TP;
+        FN = sum(confMat(c,:)) - TP;
+        if (TP+FP)==0 || (TP+FN)==0
+            f1_vals(c) = NaN;
+        else
+            prec = TP/(TP+FP);
+            rec  = TP/(TP+FN);
+            f1_vals(c) = 2*(prec*rec)/(prec+rec);
+        end
+    end
+    F1_macro = mean(f1_vals,'omitnan');
+end
+
+function [macroPrec, macroRec] = multiClassPrecRec(confMat)
+    C = size(confMat,1);
+    precVals = zeros(C,1);
+    recVals  = zeros(C,1);
+    for c = 1:C
+        TP = confMat(c,c);
+        FP = sum(confMat(:,c)) - TP;
+        FN = sum(confMat(c,:)) - TP;
+        if (TP+FP)>0
+            precVals(c) = TP/(TP+FP);
+        else
+            precVals(c)=NaN;
+        end
+        if (TP+FN)>0
+            recVals(c) = TP/(TP+FN);
+        else
+            recVals(c)=NaN;
+        end
+    end
+    macroPrec = mean(precVals,'omitnan');
+    macroRec  = mean(recVals,'omitnan');
+end
+
+function [Xshifted, BISshifted, subsetData] = shiftBISbyOffset(dataStruct, X, BIS, offset)
+    n = size(X,1);
+    if n~=length(BIS) || n~=length(dataStruct)
+        error('shiftBISbyOffset: inconsistent row counts among X,BIS,dataStruct');
+    end
+    if n<=offset
+        Xshifted   = [];
+        BISshifted = [];
+        subsetData = [];
+        return;
+    end
+    idx_end = n-offset;
+    Xshifted   = X(1:idx_end, :);
+    BISshifted = BIS((1+offset):(idx_end+offset));
+    subsetData = dataStruct(1:idx_end);
+    for i=1:idx_end
+        futureIdx = i+offset;
+        subsetData(i).BISMedian_future = dataStruct(futureIdx).BISMedian;
+        subsetData(i).Window_future    = dataStruct(futureIdx).Window;
+    end
+end
+
+function [featMatrix, featNames] = createHistoricPredBISFeatures(dataSorted, predBIS_sorted, windowDuration)
+    n = length(dataSorted);
+    featMatrix = zeros(n, 12);
+    featNames = { 'timeSinceFirstBelow60', 'timeSinceAnyBelow60', 'BIS_EMA', ...
+                  'BISmean', 'BISmin', 'BISq1', 'BISmedian', 'BISq3', 'BISmax', ...
+                  'prevPredBIS', 'deltaPredBIS', 'currPredBIS' };
+    alpha = 0.3; 
+    lastPatient = -1;
+    firstBelow60HasOccurred = false;
+    timeSinceFirst = 0;
+    timeSinceAny   = 0;
+    EMA_prev = 0;
+    sumSoFar = 0;
+    countSoFar = 0;
+    bisHistory = [];
+    prevBIS_val = NaN;
+
+    for i = 1:n
+        pID = dataSorted(i).Patient_ID;
+        if pID~=lastPatient
+            firstBelow60HasOccurred = false;
+            timeSinceFirst = 0;
+            timeSinceAny   = 0;
+            EMA_prev       = predBIS_sorted(i);
+            sumSoFar = 0;
+            countSoFar= 0;
+            bisHistory= [];
+            prevBIS_val= predBIS_sorted(i);
+            lastPatient= pID;
+        end
+        currBIS = predBIS_sorted(i);
+        if ~firstBelow60HasOccurred
+            if currBIS<60
+                firstBelow60HasOccurred=true;
+                timeSinceFirst=0;
+            else
+                timeSinceFirst= timeSinceFirst+1;
+            end
+        else
+            timeSinceFirst= timeSinceFirst+1;
+        end
+        if currBIS<60
+            timeSinceAny=0;
+        else
+            timeSinceAny= timeSinceAny+1;
+        end
+        if i==1 || pID~= dataSorted(i-1).Patient_ID
+            EMA_curr= currBIS;
+        else
+            EMA_curr= alpha*currBIS + (1-alpha)*EMA_prev;
+        end
+        sumSoFar= sumSoFar+ currBIS;
+        countSoFar= countSoFar+1;
+        meanSoFar= sumSoFar/countSoFar;
+        bisHistory(end+1)= currBIS; %#ok<AGROW>
+        sortedHist= sort(bisHistory);
+        minSoFar= sortedHist(1);
+        maxSoFar= sortedHist(end);
+        medianSoFar= median(sortedHist);
+        q1SoFar= prctile(sortedHist,25);
+        q3SoFar= prctile(sortedHist,75);
+        prevBIS= prevBIS_val;
+        deltaBIS= currBIS- prevBIS;
+
+        featMatrix(i,1)= timeSinceFirst* windowDuration;
+        featMatrix(i,2)= timeSinceAny * windowDuration;
+        featMatrix(i,3)= EMA_curr;
+        featMatrix(i,4)= meanSoFar;
+        featMatrix(i,5)= minSoFar;
+        featMatrix(i,6)= q1SoFar;
+        featMatrix(i,7)= medianSoFar;
+        featMatrix(i,8)= q3SoFar;
+        featMatrix(i,9)= maxSoFar;
+        featMatrix(i,10)= prevBIS;
+        featMatrix(i,11)= deltaBIS;
+        featMatrix(i,12)= currBIS;
+
+        EMA_prev= EMA_curr;
+        prevBIS_val= currBIS;
+    end
+end
+
+function perf = huberperf(net, t, y, e, x, perfWeights)
+    if ~isfield(net.performParam, 'delta')
+        delta = 1.0;
+    else
+        delta = net.performParam.delta;
+    end
+
+    eabs = abs(e);
+    isQuad = (eabs <= delta);
+    isLin  = ~isQuad;
+
+    huberVals = zeros(size(e));
+    huberVals(isQuad) = 0.5 * ( e(isQuad) ).^2;
+    huberVals(isLin)  = delta * ( eabs(isLin) - 0.5*delta );
+
+    if isempty(perfWeights)
+        w = 1;  
+    else
+        w = perfWeights;
+    end
+
+    perf = sum(huberVals(:).* w(:)) / sum(w(:));
+end
+
+function plot_BIS_SQI_patient(fold, patientID, allFolds_testSet, allFolds_predictedBIS, ...
+                              allFolds_futureTestSet, allFolds_futurePredBIS, ...
+                              allFolds_futureLower, allFolds_futureUpper, ...
+                              future_BIS_offset, window_duration, tracksRoot, outDir)
+
+    if ~exist(outDir,'dir'), mkdir(outDir); end
+
+    Test = allFolds_testSet{fold};
+    yhat_curr = allFolds_predictedBIS{fold};
+    if isempty(Test) || isempty(yhat_curr)
+        warning('No testSet or predictions present for fold=%d', fold);
+        return;
+    end
+    p_idx = find([Test.Patient_ID] == patientID);
+    if isempty(p_idx)
+        warning('No test samples for patient %d in fold %d.', patientID, fold);
+        return;
+    end
+
+    t_win  = double([Test(p_idx).Window]);
+    y_act  = double([Test(p_idx).BISMedian]);
+    y_pred = double(yhat_curr(p_idx));
+
+    [t_win, ord] = sort(t_win);
+    y_act  = y_act(ord);
+    y_pred = y_pred(ord);
+
+    t_sec_curr = t_win * window_duration;
+    t0_rel     = min(t_sec_curr);
+    t_sec_curr = t_sec_curr - t0_rel;
+
+    Fut    = [];
+    yhat_f = []; ylo = []; yhi = [];
+    if fold <= numel(allFolds_futureTestSet)
+        Fut = allFolds_futureTestSet{fold};
+        yhat_f = allFolds_futurePredBIS{fold};
+        if fold <= numel(allFolds_futureLower), ylo = allFolds_futureLower{fold}; end
+        if fold <= numel(allFolds_futureUpper), yhi = allFolds_futureUpper{fold}; end
+    end
+
+    haveFuture = ~(isempty(Fut) || isempty(yhat_f));
+    if haveFuture
+        q = find([Fut.Patient_ID] == patientID);
+        if ~isempty(q)
+            t_win_future = double([Fut(q).Window_future]);
+            y_pred_f     = double(yhat_f(q));
+            y_lo = []; y_hi = [];
+            if ~isempty(ylo) && numel(ylo) >= max(q), y_lo = double(ylo(q)); end
+            if ~isempty(yhi) && numel(yhi) >= max(q), y_hi = double(yhi(q)); end
+
+            [t_win_future, idxS] = sort(t_win_future);
+            y_pred_f  = y_pred_f(idxS);
+            if ~isempty(y_lo), y_lo = y_lo(idxS); end
+            if ~isempty(y_hi), y_hi = y_hi(idxS); end
+
+            t_win_shifted = t_win_future - future_BIS_offset;
+            t_sec_fut     = t_win_shifted * window_duration - t0_rel;
+
+            keep = (t_sec_fut >= 0);
+            t_sec_fut = t_sec_fut(keep);
+            y_pred_f  = y_pred_f(keep);
+            if ~isempty(y_lo), y_lo = y_lo(keep); end
+            if ~isempty(y_hi), y_hi = y_hi(keep); end
+        else
+            haveFuture = false;
+        end
+    end
+
+    caseDir = fullfile(tracksRoot, sprintf('case_%04d', patientID));
+    D = dir(fullfile(caseDir, 'SQI_*.csv'));
+    ts = []; vs = [];
+    for k = 1:numel(D)
+        Tk = readtable(fullfile(D(k).folder,D(k).name), 'VariableNamingRule','preserve');
+        if height(Tk) >= 1 && width(Tk) >= 2
+            tk = double(Tk{:,1}); vk = double(Tk{:,2});
+            g  = isfinite(tk) & isfinite(vk);
+            ts = [ts; tk(g)];
+            vs = [vs; vk(g)];
+        end
+    end
+    haveSQI = ~isempty(ts);
+    if haveSQI
+        [ts, ord2] = sort(ts); vs = vs(ord2);
+        if max(vs) <= 1, vs = vs * 100; end
+        ts_rel = ts - min(ts);
+
+        xmin = min(t_sec_curr); 
+        xmax = max([t_sec_curr; haveFuture*max(t_sec_fut)]);
+        inSpan = (ts_rel >= xmin) & (ts_rel <= xmax);
+        vSpan = vs(inSpan);
+        SQI_mean = mean(vSpan, 'omitnan');
+        pct80    = 100 * mean(vSpan > 80, 'omitnan');
+        pct95    = 100 * mean(vSpan > 95, 'omitnan');
+    else
+        SQI_mean = NaN; pct80 = NaN; pct95 = NaN;
+    end
+
+    f = figure('Color','w','Name',sprintf('Fold%d_Pt%d_BIS_SQI',fold,patientID), ...
+               'Position',[120 120 1100 650]);
+    hold on; grid on;
+
+    yyaxis left
+    plot(t_sec_curr, y_act,  '-o', 'LineWidth', 1.7);
+    plot(t_sec_curr, y_pred, '-x', 'LineWidth', 1.7);
+    if haveFuture
+        plot(t_sec_fut,  y_pred_f, '-s', 'LineWidth', 1.7);
+        if ~isempty(y_lo) && ~isempty(y_hi)
+            plot(t_sec_fut, y_lo, '--', 'LineWidth', 1.0);
+            plot(t_sec_fut, y_hi, '--', 'LineWidth', 1.0);
+        end
+    end
+    ylim([0 100]); ylabel('BIS (actual/predicted)');
+
+    if haveSQI
+        yyaxis right
+        plot(ts_rel, vs, '-', 'LineWidth', 1.2);
+        ylim([0 100]); ylabel('SQI');
+    end
+
+    xlabel('Time (s, relative)');
+    if haveFuture && ~isempty(y_lo) && ~isempty(y_hi) && haveSQI
+        legend({'BIS (actual)','BIS (pred current)','BIS (pred future)','Future lower','Future upper','SQI'}, ...
+               'Location','bestoutside');
+    elseif haveFuture && haveSQI
+        legend({'BIS (actual)','BIS (pred current)','BIS (pred future)','SQI'}, 'Location','bestoutside');
+    elseif haveSQI
+        legend({'BIS (actual)','BIS (pred current)','SQI'}, 'Location','bestoutside');
+    else
+        legend({'BIS (actual)','BIS (pred current)'}, 'Location','bestoutside');
+    end
+
+    title(sprintf('Fold %d  |  Patient %d  |  SQI mean %.1f  (>80: %.0f%%, >95: %.0f%%)', ...
+          fold, patientID, SQI_mean, pct80, pct95));
+
+    fn = fullfile(outDir, sprintf('Fold%02d_Patient_%04d_BIS_SQI.png', fold, patientID));
+    saveas(gcf, fn);
+    fprintf('Saved BIS+SQI overlay: %s\n', fn);
+end
+
+function [featTypeIdx, bandIdx] = decodeFeatureIndex(colIdx, num_bands)
+    featTypeIdx = ceil(colIdx / num_bands);
+    bandIdx     = colIdx - (featTypeIdx-1)*num_bands;
+end
+
+function lbl = featureIndexToLabel(origIdx, num_bands, histFeatureNames)
+    totalEEG = 10 * num_bands;   % e.g. 300
+    if origIdx <= totalEEG
+        [featTypeIdx, bandIdx] = decodeFeatureIndex(origIdx, num_bands);
+        lbl = sprintf('EEG_F%d_B%d', featTypeIdx, bandIdx);
+    else
+        hIdx = origIdx - totalEEG;
+        if nargin >= 3 && ~isempty(histFeatureNames) && ...
+                hIdx >= 1 && hIdx <= numel(histFeatureNames)
+            baseName = histFeatureNames{hIdx};
+            baseName = regexprep(baseName,'\s+','');
+            lbl = sprintf('Hist_%s', baseName);
+        else
+            lbl = sprintf('Hist_%d', hIdx);
+        end
+    end
+end
