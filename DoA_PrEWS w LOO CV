@@ -1,0 +1,1700 @@
+ clc;
+clearvars;
+
+%% 0. Plotting Mode %%% NEW %%%
+%  plotMode = 0 => do not plot any patients
+%  plotMode = 1 => plot all patients in all folds
+%  plotMode = 2 => plot all patients in final fold only
+%  plotMode = 3 => plot only the patients in 'selectedPatients' )
+plotMode = 0;  
+
+% If plotMode=3, specify which patients to plot (for final fold)
+selectedPatients = [3617, 5604, 1634, 5925];  % example IDs
+
+%% 1. Paths, Parameters, Setup
+addpath('C:\Research project Backup 05072025\Research Project\VitalDB_Data_V6\Extracted_Feaetures_2');
+rng(0); % For reproducibility
+
+%% Core parameters
+window_duration   = 30;   
+num_features      = 10;   % # features per band
+num_bands         = 30;   % total bands => 300 columns
+k                 = 5;    % folds for cross-validation
+max_windows       = 15;   % +/- around target
+target_type       = 'LoC';% 'RoC' or 'LoC'
+target_offset     = 0;    % used for LoC/RoC prediction offset 
+overlap_ratio     = 1.2;  % SMOTE partial overlap
+k_neighbors       = 5;    
+downsample_ratio  = 0.4;  
+num_trees         = 100;  % random forest used in RFE
+min_leaf_size     = 1;    
+max_num_splits    = 50;   
+num_to_select     = 5;    % # features after RFE
+future_BIS_offset = 4;    % windows ahead to predict BIS future values
+topN = 50;
+
+% Data location
+USQ_data = 'C:\Research project Backup 05072025\Research Project\TWB_Prediction_FE_V2\30\results_USQ_w30_V2.mat'
+results_file = USQ_data;
+%results_file = 'C:\Research project Backup 05072025\Research Project\VitalDB_Data_V6\Extracted_Feaetures_2\30\results_3.mat';
+if ~isfile(results_file)
+    error("Results file not found: %s", results_file);
+end
+load(results_file, 'results'); 
+
+%% Rescaling results times
+scaling_factor = 30 / window_duration;  
+temp_results = results;  
+temp_results.StartTime   = round(results.StartTime   * scaling_factor);
+temp_results.EndTime     = round(results.EndTime     * scaling_factor);
+temp_results.FirstBelow60= round(results.FirstBelow60* scaling_factor);
+temp_results.LastBelow60 = round(results.LastBelow60 * scaling_factor);
+results = temp_results;
+
+%% 2. Load Data (EEG only)
+all_data = [];
+
+for i = 1:height(results)
+    patient_id  = results.FileNumber(i);
+    start_time  = results.StartTime(i);
+    end_time    = results.EndTime(i);
+
+    if strcmpi(target_type, 'LoC')
+        target_time = results.FirstBelow60(i);
+    else
+        target_time = results.LastBelow60(i);
+    end
+
+    firstBelow = results.FirstBelow60(i);
+    lastBelow  = results.LastBelow60(i);
+
+    if isnan(target_time) || isnan(firstBelow) || isnan(lastBelow)
+        warning('Patient %d missing target_time or first/lastBelow60 => skipping.', patient_id);
+        continue;
+    end
+
+    adjusted_target_time = target_time - target_offset;
+
+    patient_file = "C:\Research project Backup 05072025\Research Project\TWB_Prediction_FE_V2\" + ...
+                   window_duration + "\TWB_Features_Patient_" + ...
+                   patient_id + "_Window_" + window_duration + "s.mat";
+
+    if ~isfile(patient_file)
+        warning("Patient data file not found: %s. Skipping.", patient_file);
+        continue;
+    end
+    
+    try
+        load(patient_file, 'feature_data');
+    catch ME
+        warning("Error loading file: %s. Error: %s. Skipping.", patient_file, ME.message);
+        continue;
+    end
+    
+    if isempty(feature_data)
+        warning("No valid feature_data in: %s. Skipping.", patient_file);
+        continue;
+    end
+
+    for j = 1:length(feature_data)
+        wtime = feature_data(j).Window;
+        if wtime >= start_time && wtime <= end_time
+            feature_data(j).Patient_ID     = patient_id;
+            feature_data(j).time_to_target = wtime - adjusted_target_time;
+            if abs(wtime - adjusted_target_time) < eps
+                feature_data(j).state = '1';
+            else
+                feature_data(j).state = '0';
+            end
+
+           if wtime < firstBelow
+                feature_data(j).region_label = "Awake";
+            elseif wtime <= lastBelow
+                feature_data(j).region_label = "Unconscious";
+            elseif wtime < end_time          % recovering only if there is time *before* end
+                feature_data(j).region_label = "Recovering";
+            else                             % wtime == end_time → keep as Unconscious
+                feature_data(j).region_label = "Unconscious";
+            end
+
+
+            all_data = [all_data; feature_data(j)]; %#ok<AGROW>
+        end
+    end
+end
+
+if isempty(all_data)
+    error('No valid data loaded. Possibly all patients missing times or no windows in [start,end].');
+end
+
+disp('Data loaded successfully. region_label assigned (Awake/Unconscious/Recovering).');
+
+%% 3. Flatten Data
+num_data       = length(all_data);
+total_EEG_feats= num_features * num_bands;  % e.g., 300
+X_all          = zeros(num_data, total_EEG_feats);
+BIS_targets    = zeros(num_data, 1);
+TTT_targets    = zeros(num_data, 1);
+class_labels   = zeros(num_data, 1);
+region_labels  = strings(num_data, 1);
+
+for i = 1:num_data
+    X_all(i,:)     = reshape(all_data(i).EEG, 1, []);
+    BIS_targets(i) = all_data(i).BISMedian;
+    TTT_targets(i) = all_data(i).time_to_target;
+    class_labels(i)= str2double(all_data(i).state);
+
+    if isfield(all_data(i), 'region_label')
+        region_labels(i) = all_data(i).region_label;
+    else
+        region_labels(i) = "Unknown";
+    end
+end
+
+disp('Flattening complete. region_labels assigned (Unknown if missing).');
+
+%% 4.1 Feature selection with Saving
+%% 4. Feature selection (load-or-build)  --- DROP-IN REPLACEMENT ---
+useSavedFeatures = 1;   % set to 1 to use cached features, 0 to force recompute
+
+% Where feature caches live (NOTE: Features, not Hyperparameters)
+featuresDir = "C:\Research project Backup 05072025\Research Project\All_features\LoC_Prediction\LoCV2\parameters\Features";
+featuresFile = fullfile(featuresDir, ...
+    sprintf("USQ_saved_features_%s_Feats_%ds_window_%d_features_V3.mat", ...
+            target_type, window_duration, num_to_select));
+
+% Predeclare (avoids "undefined variable" later)
+finalBISfeatures   = [];
+finalTTTfeatures   = [];
+finalClassFeatures = [];
+
+needRecompute = (useSavedFeatures == 0);
+
+if ~needRecompute
+    if exist(featuresFile,'file')
+        varsInFile = {whos('-file', featuresFile).name};
+        required   = {'finalBISfeatures','finalTTTfeatures','finalClassFeatures'};
+        if all(ismember(required, varsInFile))
+            S = load(featuresFile, required{:});
+            finalBISfeatures   = unique(S.finalBISfeatures(:),   'stable');
+            finalTTTfeatures   = unique(S.finalTTTfeatures(:),   'stable');
+            finalClassFeatures = unique(S.finalClassFeatures(:), 'stable');
+
+            % sanity check against current design dimension
+            D = size(X_all, 2);
+            bad = @(idx) any(idx < 1 | idx > D) || any(~isfinite(idx));
+            if bad(finalBISfeatures) || bad(finalTTTfeatures) || bad(finalClassFeatures)
+                warning('Cached feature indices are incompatible with current X_all (D=%d). Recomputing.', D);
+                needRecompute = true;
+            else
+                fprintf('Loaded cached feature sets from:\n  %s\n', featuresFile);
+            end
+        else
+            warning('Feature cache exists but lacks required variables. Recomputing.');
+            needRecompute = true;
+        end
+    else
+        warning('Feature cache not found at:\n  %s\nRecomputing.', featuresFile);
+        needRecompute = true;
+    end
+end
+
+if needRecompute
+    % --- identical logic to your current pipeline ---
+    [pre_BIS, ~] = preselectFeaturesByMI(X_all, BIS_targets, topN);
+    sel_BIS = performRFE(X_all, BIS_targets, pre_BIS, num_to_select, num_trees);
+    finalBISfeatures = addRelationshipBasedFeatures(X_all, BIS_targets, sel_BIS, 3, []);
+    finalBISfeatures = unique(finalBISfeatures(:), 'stable');
+
+    [pre_TTT, ~] = preselectFeaturesByMI(X_all, TTT_targets, topN);
+    sel_TTT = performRFE(X_all, TTT_targets, pre_TTT, num_to_select, num_trees);
+    finalTTTfeatures = addRelationshipBasedFeatures(X_all, TTT_targets, sel_TTT, 3, []);
+    finalTTTfeatures = unique(finalTTTfeatures(:), 'stable');
+
+    [pre_Clf, ~] = preselectFeaturesByMI(X_all, class_labels, topN);
+    sel_Clf = performRFE(X_all, class_labels, pre_Clf, num_to_select, num_trees);
+    finalClassFeatures = addRelationshipBasedFeatures(X_all, class_labels, sel_Clf, 3, []);
+    finalClassFeatures = unique(finalClassFeatures(:), 'stable');
+
+    % ensure output directory exists, then save
+    if ~exist(featuresDir, 'dir'); mkdir(featuresDir); end
+    save(featuresFile, 'finalBISfeatures', 'finalTTTfeatures', 'finalClassFeatures', '-v7');
+    fprintf('Computed feature sets saved to:\n  %s\n', featuresFile);
+end
+
+
+%% 5.1. Hyperparameter optimisation with saving for BIS GPR
+useSavedHyper = 1;
+
+if useSavedHyper == 1
+    loadFileName = ...
+      "C:\Research project Backup 05072025\Research Project\All_features\LoC_Prediction\LoCV2\parameters\Hyperparameters\saved_hyper_parameters_LoC_params_30s_window.mat";
+    if exist(loadFileName, 'file')
+        load(loadFileName, 'bestBISParams');
+        fprintf('Loaded saved BIS hyperparameters from %s.\n', loadFileName);
+    else
+        warning('No saved hyperparameters found. Running optimisation...');
+        useSavedHyper = 0;
+    end
+end
+
+if useSavedHyper == 0
+    fprintf('Optimizing BIS model (Matern52 GPR)...\n');
+    bestBISModel = fitrgp(X_all(:, finalBISfeatures), BIS_targets, ...
+        'KernelFunction', 'matern52', ...
+        'OptimizeHyperparameters', 'auto', ...
+        'HyperparameterOptimizationOptions', struct( ...
+            'AcquisitionFunctionName', 'expected-improvement-plus', ...
+            'MaxObjectiveEvaluations', 20, ...
+            'UseParallel', true, ...
+            'ShowPlots', false, ...
+            'Verbose', 1));
+    bestBISParams = bestBISModel.ModelParameters;
+    disp(bestBISParams);
+  
+    saveFileName = ...
+      "C:\Research project Backup 05072025\Research Project\All_features\LoC_Prediction\LoCV2\parameters\Hyperparameters\USQ_saved_hyper_parameters_" + ...
+      target_type + "_params_" + window_duration + "s_window_V2.mat";
+    save(saveFileName, 'bestBISParams');
+    fprintf('Saved BIS hyperparameters to %s.\n', saveFileName);
+end
+
+%% 6. Cross-Validation
+%% CV strategy
+useLOO = true;  % true = Leave-One-Patient-Out; false = use K-fold as before
+%% 6. Cross-Validation  (now supports LOO)
+patientIDs  = unique([all_data.Patient_ID]);
+numPatients = numel(patientIDs);
+
+%indices    = crossvalind('Kfold', patientIDs, k);
+
+if useLOO
+    Kfolds = numPatients;              % one fold per patient
+else
+    Kfolds = k;                         % keep your existing K value
+    % Build folds across patients (not rows) to avoid patient leakage
+    idxPatients = crossvalind('Kfold', numPatients, Kfolds);
+end
+
+% For BIS regression metrics
+correlation_BIS_metrics = [];
+
+% For region classification
+region_confMat_sum = zeros(3,3);
+region_metrics_all = zeros(Kfolds,4);
+
+% For future BIS
+correlation_futureBIS = [];
+
+% For TTT model
+correlation_metrics = [];
+
+% For binary classification (transition)
+rfMetrics        = [];
+clf2_confMat_sum = zeros(2,2);
+
+
+% Per-fold stores for plotting
+allFolds_testSet         = cell(Kfolds,1);
+allFolds_predictedBIS    = cell(Kfolds,1);
+allFolds_finalProbs      = cell(Kfolds,1);
+allFolds_ensemble_models = cell(Kfolds,1);
+
+allFolds_futureTestSet = cell(Kfolds,1);
+allFolds_futurePredBIS = cell(Kfolds,1);
+allFolds_futureLower   = cell(Kfolds,1);
+allFolds_futureUpper   = cell(Kfolds,1);
+
+%%% We can optionally track also the Xtest_BIS if needed, but typically storing testSet is enough.
+for fold = 1:Kfolds
+    % -------------------------------
+    % Patient split (LOO vs K-fold)
+    % -------------------------------
+    if useLOO
+        % LOO: hold out exactly one patient
+        testPatients  = patientIDs(fold);
+        trainPatients = patientIDs([1:fold-1, fold+1:end]);
+    else
+        % K-fold across patients (as before, but indexed on patients, not rows)
+        testPatients  = patientIDs(idxPatients == fold);
+        trainPatients = patientIDs(idxPatients ~= fold);
+    end
+
+    trainSet = all_data(ismember([all_data.Patient_ID], trainPatients));
+    testSet  = all_data(ismember([all_data.Patient_ID], testPatients));
+
+    [Xtrain_BIS, BIStrain, ~, ~] = prepareData(trainSet, num_features, num_bands);
+    [Xtest_BIS,  BIStest,  ~, ~] = prepareData(testSet,  num_features, num_bands);
+
+    [Xtrain_TTT, ~, TTTtrain, StateTrain] = prepareData(trainSet, num_features, num_bands);
+    [Xtest_TTT,  ~, TTTtest,  StateTest]  = prepareData(testSet,  num_features, num_bands);
+
+    %% 6A) BIS GPR
+    BISmodel_fold = fitrgp( ...
+        Xtrain_BIS(:, finalBISfeatures), ...
+        BIStrain, ...
+        'KernelFunction','matern52', ...
+        'BasisFunction', bestBISParams.BasisFunction, ...
+        'Sigma',         bestBISParams.Sigma, ...
+        'Standardize',   true);
+
+    predictedBIS_train = predict(BISmodel_fold, Xtrain_BIS(:, finalBISfeatures));
+    predictedBIS_test  = predict(BISmodel_fold, Xtest_BIS(:, finalBISfeatures));
+
+    mae_BIS  = mean(abs(predictedBIS_test - BIStest));
+    rmse_BIS = sqrt(mean((predictedBIS_test - BIStest).^2));
+
+    corr_BIS_train = corr(predictedBIS_train, BIStrain);
+    corr_BIS_test  = corr(predictedBIS_test,  BIStest);
+
+    correlation_BIS_metrics = [correlation_BIS_metrics; ...
+                               corr_BIS_train, corr_BIS_test, rmse_BIS, mae_BIS];
+    fprintf('Fold %d BIS => MAE=%.2f, RMSE=%.2f, CorrTrain=%.2f, CorrTest=%.2f\n',...
+            fold, mae_BIS, rmse_BIS, corr_BIS_train, corr_BIS_test);
+%%
+% Bland-Altman plot (difference vs mean)
+mean_BIS = mean([predictedBIS_test, BIStest], 2);
+diff_BIS = predictedBIS_test - BIStest;
+
+bias = mean(diff_BIS);
+sd_diff = std(diff_BIS);
+loa_upper = bias + 1.96 * sd_diff;
+loa_lower = bias - 1.96 * sd_diff;
+
+figure;
+scatter(mean_BIS, diff_BIS, 25, 'filled', 'MarkerFaceAlpha', 0.6);
+hold on;
+yline(bias, 'k--', 'LineWidth', 1.5, 'Label', 'Mean Bias');
+yline(loa_upper, 'r--', 'LineWidth', 1.5, 'Label', '+1.96 SD');
+yline(loa_lower, 'r--', 'LineWidth', 1.5, 'Label', '-1.96 SD');
+
+xlabel('Mean of Predicted and Actual BIS');
+ylabel('Difference (Predicted - Actual)');
+title('Bland-Altman Plot of BIS Prediction');
+grid on;
+hold off;
+
+
+    %% New Feature Generation (historical predicted BIS)
+    trainSet_sorted = sortrows(struct2table(trainSet), {'Patient_ID','Window'});
+    testSet_sorted  = sortrows(struct2table(testSet),  {'Patient_ID','Window'});
+
+    trainSet_sorted = table2struct(trainSet_sorted);
+    testSet_sorted  = table2struct(testSet_sorted);
+
+    [~, idxTrainMap] = sort([trainSet.Patient_ID]*1e8 + [trainSet.Window]); 
+    predBIS_train_sorted = predictedBIS_train(idxTrainMap);
+
+    [~, idxTestMap] = sort([testSet.Patient_ID]*1e8 + [testSet.Window]);
+    predBIS_test_sorted = predictedBIS_test(idxTestMap);
+
+    [featHistTrain, newFeatureNamesTrain] = ...
+        createHistoricPredBISFeatures(trainSet_sorted, predBIS_train_sorted, window_duration);
+    [featHistTest,  newFeatureNamesTest]  = ...
+        createHistoricPredBISFeatures(testSet_sorted,  predBIS_test_sorted,  window_duration);
+
+    nFeatRowsTrain = size(featHistTrain, 1);
+    validTrain     = idxTrainMap <= nFeatRowsTrain;
+    inverseIdxTrainMap = zeros(size(idxTrainMap));
+    inverseIdxTrainMap(validTrain) = 1:sum(validTrain);
+    featHistTrain_unsorted = featHistTrain(inverseIdxTrainMap(validTrain), :);
+
+    nFeatRowsTest = size(featHistTest, 1);
+    validTest     = idxTestMap <= nFeatRowsTest;
+    inverseIdxTestMap = zeros(size(idxTestMap));
+    inverseIdxTestMap(validTest) = 1:sum(validTest);
+    featHistTest_unsorted = featHistTest(inverseIdxTestMap(validTest), :);
+
+    Xtrain_BIS = Xtrain_BIS(validTrain, :);
+    Xtest_BIS  = Xtest_BIS(validTest, :);
+
+    Xtrain_BIS = [Xtrain_BIS, featHistTrain_unsorted];
+    Xtest_BIS  = [Xtest_BIS,  featHistTest_unsorted];
+
+    %% 6A.2) Region Classification
+    Ytrain_region_str = strings(length(trainSet),1);
+    for iR = 1:length(trainSet)
+        Ytrain_region_str(iR) = trainSet(iR).region_label;
+    end
+    Ytrain_region_num = regionStr2Num(Ytrain_region_str);
+
+    Ytest_region_str = strings(length(testSet),1);
+    for iR = 1:length(testSet)
+        Ytest_region_str(iR) = testSet(iR).region_label;
+    end
+    Ytest_region_num = regionStr2Num(Ytest_region_str);
+
+    idx_c1 = find(Ytrain_region_num == 1);
+    idx_c2 = find(Ytrain_region_num == 2);
+    idx_c3 = find(Ytrain_region_num == 3);
+    count1 = length(idx_c1);
+    count2 = length(idx_c2);
+    count3 = length(idx_c3);
+    maxCount = max([count1, count2, count3]);
+
+    Xtrain_region = Xtrain_BIS;
+    Xc1 = Xtrain_region(idx_c1,:);
+    short1 = maxCount - count1;
+    if short1 > 0
+        syn1 = smote(Xc1, short1, k_neighbors);
+        Xc1_aug = [Xc1; syn1];
+        Yc1_aug = [repmat(1, size(Xc1,1),1); repmat(1, size(syn1,1),1)];
+    else
+        Xc1_aug = Xc1;
+        Yc1_aug = repmat(1, count1,1);
+    end
+
+    Xc2 = Xtrain_region(idx_c2,:);
+    short2 = maxCount - count2;
+    if short2 > 0
+        syn2 = smote(Xc2, short2, k_neighbors);
+        Xc2_aug = [Xc2; syn2];
+        Yc2_aug = [repmat(2, size(Xc2,1),1); repmat(2, size(syn2,1),1)];
+    else
+        Xc2_aug = Xc2;
+        Yc2_aug = repmat(2, count2,1);
+    end
+
+    Xc3 = Xtrain_region(idx_c3,:);
+    short3 = maxCount - count3;
+    if short3 > 0
+        syn3 = smote(Xc3, short3, k_neighbors);
+        Xc3_aug = [Xc3; syn3];
+        Yc3_aug = [repmat(3, size(Xc3,1),1); repmat(3, size(syn3,1),1)];
+    else
+        Xc3_aug = Xc3;
+        Yc3_aug = repmat(3, count3,1);
+    end
+
+    X_smote_train = [Xc1_aug; Xc2_aug; Xc3_aug];
+    Y_smote_train = [Yc1_aug; Yc2_aug; Yc3_aug];
+    idx_sh = randperm(size(X_smote_train,1));
+    X_smote_train = X_smote_train(idx_sh,:);
+    Y_smote_train = Y_smote_train(idx_sh);
+    Y_smote_cat   = categorical(Y_smote_train, [1,2,3], {'Awake','Unconscious','Recovering'});
+
+    extraFeatureIdx = (301:312)';  
+    ClassificationBISfeatures = [finalBISfeatures; extraFeatureIdx];
+
+    regionModel = fitcensemble(X_smote_train(:, ClassificationBISfeatures), ...
+                               Y_smote_cat, 'Method','Bag', ...
+                               'NumLearningCycles',100);
+    Xtest_region = Xtest_BIS;
+    Ytest_region_cat = categorical(Ytest_region_num, [1,2,3], ...
+                                   {'Awake','Unconscious','Recovering'});
+    pred_region = predict(regionModel, Xtest_region(:, ClassificationBISfeatures));
+    confMat_region = confusionmat(Ytest_region_cat, pred_region, ...
+                                  'Order',{'Awake','Unconscious','Recovering'});
+    disp('Confusion Matrix (Region Classification):');
+    disp(confMat_region);
+    fold_regionF1 = computeMultiClassF1(confMat_region);
+    fprintf('Fold %d => Region Macro-F1=%.2f%%\n', fold, fold_regionF1*100);
+
+    overallAcc = sum(diag(confMat_region)) / sum(confMat_region(:));
+    class_precision = zeros(1,3);
+    class_recall    = zeros(1,3);
+    class_specificity = zeros(1,3);
+    class_f1        = zeros(1,3);
+    class_accuracy  = zeros(1,3);
+    for c = 1:3
+        TP = confMat_region(c,c);
+        FP = sum(confMat_region(:,c)) - TP;
+        FN = sum(confMat_region(c,:)) - TP;
+        TN = sum(confMat_region(:)) - (TP+FP+FN);
+        if (TP + FN) > 0
+            class_accuracy(c) = TP / (TP + FN);
+        else
+            class_accuracy(c) = NaN;
+        end
+        if (TP + FP) > 0
+            class_precision(c) = TP / (TP + FP);
+        else
+            class_precision(c) = NaN;
+        end
+        if (TP + FN) > 0
+            class_recall(c) = TP / (TP + FN);
+        else
+            class_recall(c) = NaN;
+        end
+        if (TN + FP) > 0
+            class_specificity(c) = TN / (TN + FP);
+        else
+            class_specificity(c) = NaN;
+        end
+        if ~isnan(class_precision(c)) && ~isnan(class_recall(c)) ...
+                && (class_precision(c) + class_recall(c))>0
+            class_f1(c) = 2*(class_precision(c)*class_recall(c)) ...
+                            /(class_precision(c)+class_recall(c));
+        else
+            class_f1(c) = NaN;
+        end
+    end
+    macro_precision   = mean(class_precision,   'omitnan');
+    macro_recall      = mean(class_recall,      'omitnan');
+    macro_specificity = mean(class_specificity, 'omitnan');
+    macro_f1          = mean(class_f1,          'omitnan');
+    mean_class_acc    = mean(class_accuracy,    'omitnan');
+
+    fprintf('Fold %d => OverallAcc=%.2f%%, MacroPrec=%.2f%%, MacroRec=%.2f%%, MacroSpec=%.2f%%, MacroF1=%.2f%%\n',...
+         fold, 100*overallAcc, 100*macro_precision, 100*macro_recall, 100*macro_specificity, 100*macro_f1);
+    fprintf(' Class1(Awake) => Acc=%.2f%%, Prec=%.2f%%, Rec=%.2f%%, Spec=%.2f%%, F1=%.2f%%\n',...
+         100*class_accuracy(1), 100*class_precision(1), 100*class_recall(1), ...
+         100*class_specificity(1), 100*class_f1(1));
+    fprintf(' Class2(Uncns) => Acc=%.2f%%, Prec=%.2f%%, Rec=%.2f%%, Spec=%.2f%%, F1=%.2f%%\n',...
+         100*class_accuracy(2), 100*class_precision(2), 100*class_recall(2), ...
+         100*class_specificity(2), 100*class_f1(2));
+    fprintf(' Class3(Recov) => Acc=%.2f%%, Prec=%.2f%%, Rec=%.2f%%, Spec=%.2f%%, F1=%.2f%%\n',...
+         100*class_accuracy(3), 100*class_precision(3), 100*class_recall(3), ...
+         100*class_specificity(3), 100*class_f1(3));
+    fprintf(' Average Class Accuracy=%.2f%%\n', 100*mean_class_acc);
+
+    region_confMat_sum = region_confMat_sum + confMat_region;
+    region_metrics_all(fold,:) = [overallAcc, macro_precision, macro_recall, macro_f1];
+
+    %% 6A.3) Future BIS
+    [Xtrain_futureBIS, BIS_future_train, subsetDataTrain_future] = ...
+        shiftBISbyOffset(trainSet, Xtrain_BIS, BIStrain, future_BIS_offset);
+    [Xtest_futureBIS,  BIS_future_test,  subsetDataTest_future]  = ...
+        shiftBISbyOffset(testSet,  Xtest_BIS,  BIStest,  future_BIS_offset);
+
+    corr_future_train = NaN; corr_future_test = NaN;
+    rmse_future_train = NaN; mae_future_train = NaN;
+    rmse_future_test  = NaN; mae_future_test  = NaN;
+    if ~isempty(Xtrain_futureBIS) && ~isempty(Xtest_futureBIS)
+        extraFeatureIdx = (301:312)';  
+        futureBISfeatures = [finalBISfeatures; extraFeatureIdx];
+
+        futureBISmodel = fitrgp( ...
+            Xtrain_futureBIS(:, futureBISfeatures), ...
+            BIS_future_train, ...
+            'KernelFunction','matern52', ...
+            'BasisFunction', bestBISParams.BasisFunction, ...
+            'Sigma',         bestBISParams.Sigma, ...
+            'Standardize',   true, ...
+            'FitMethod','sr', 'PredictMethod','sr');
+
+        alpha = 0.10; % 90% CI
+        [futureBIS_train_pred, ysd_train] = predict(futureBISmodel, Xtrain_futureBIS(:,futureBISfeatures));
+        [futureBIS_test_pred,  ysd_test]  = predict(futureBISmodel, Xtest_futureBIS(:, futureBISfeatures));
+
+        zVal = norminv((1 + 0.90)/2);  
+        lower_train = futureBIS_train_pred - zVal*ysd_train;
+        upper_train = futureBIS_train_pred + zVal*ysd_train;
+        lower_test  = futureBIS_test_pred  - zVal*ysd_test;
+        upper_test  = futureBIS_test_pred  + zVal*ysd_test;
+
+        corr_future_train = corr(futureBIS_train_pred, BIS_future_train);
+        corr_future_test  = corr(futureBIS_test_pred,  BIS_future_test);
+
+        rmse_future_train = sqrt(mean((futureBIS_train_pred - BIS_future_train).^2));
+        mae_future_train  = mean(abs(futureBIS_train_pred - BIS_future_train));
+        rmse_future_test  = sqrt(mean((futureBIS_test_pred  - BIS_future_test).^2));
+        mae_future_test   = mean(abs(futureBIS_test_pred  - BIS_future_test));
+
+        coverageTrain = mean(BIS_future_train>=lower_train & BIS_future_train<=upper_train)*100;
+        coverageTest  = mean(BIS_future_test >=lower_test  & BIS_future_test <=upper_test)*100;
+
+        fprintf('Fold %d FutureBIS => CorrTrain=%.2f, CorrTest=%.2f (offset=%d)\n',...
+            fold, corr_future_train, corr_future_test, future_BIS_offset);
+        fprintf('                 => RMSE(Train)=%.2f, MAE(Train)=%.2f, RMSE(Test)=%.2f, MAE(Test)=%.2f\n',...
+            rmse_future_train, mae_future_train, rmse_future_test, mae_future_test);
+        fprintf('CoverageTrain=%.2f%%, CoverageTest=%.2f%% (90%% CI)\n', ...
+            coverageTrain, coverageTest);
+
+        %%% Store into allFolds arrays for plotting later
+        allFolds_futureTestSet{fold}  = subsetDataTest_future;
+        allFolds_futurePredBIS{fold}  = futureBIS_test_pred;
+        allFolds_futureLower{fold}    = lower_test;
+        allFolds_futureUpper{fold}    = upper_test;
+    end
+
+    correlation_futureBIS = [correlation_futureBIS; ...
+        corr_future_train, corr_future_test, ...
+        rmse_future_train, mae_future_train, rmse_future_test, mae_future_test];
+
+%%
+    %%% --- Bland-Altman Plot for Future BIS Prediction (Test Set) --- %%%
+    mean_futureBIS = mean([futureBIS_test_pred, BIS_future_test], 2);
+    diff_futureBIS = futureBIS_test_pred - BIS_future_test;
+
+    bias_future = mean(diff_futureBIS);
+    sd_diff_future = std(diff_futureBIS);
+    loa_upper_future = bias_future + 1.96 * sd_diff_future;
+    loa_lower_future = bias_future - 1.96 * sd_diff_future;
+
+    figure;
+    scatter(mean_futureBIS, diff_futureBIS, 25, 'filled', 'MarkerFaceAlpha', 0.6);
+    hold on;
+    yline(bias_future, 'k--', 'LineWidth', 1.5, 'Label', 'Mean Bias');
+    yline(loa_upper_future, 'r--', 'LineWidth', 1.5, 'Label', '+1.96 SD');
+    yline(loa_lower_future, 'r--', 'LineWidth', 1.5, 'Label', '-1.96 SD');
+
+    xlabel('Mean of Predicted and Actual Future BIS');
+    ylabel('Difference (Predicted - Actual)');
+    title(sprintf('Bland-Altman Plot of Future BIS Prediction (Fold %d)', fold));
+    grid on;
+    hold off;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% 6B) TTT Model with Expanded Training Cap
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% 0) Keep references to original TTT (unclamped)
+TTTtrain_orig = TTTtrain;  % the raw TTT from the dataset
+TTTtest_orig  = TTTtest;
+
+Xtrain_TTT = Xtrain_BIS;
+Xtest_TTT  = Xtest_BIS;
+
+% 1) Define an expanded clamp for training
+trainingMaxWindow = max_windows + 1;   % e.g. if max_windows=15, then trainingMaxWindow=25
+
+% 2) Clamp TTT at ±(max_windows+10) for training and test
+TTTtrain_clamped = max(min(TTTtrain, trainingMaxWindow), -trainingMaxWindow);
+TTTtest_clamped  = max(min(TTTtest,  trainingMaxWindow), -trainingMaxWindow);
+
+% 3) Downsample extremes on the training set so that boundary points
+%    near ±(trainingMaxWindow) do not dominate.
+idx_cap_train = (TTTtrain_clamped == trainingMaxWindow | TTTtrain_clamped == -trainingMaxWindow);
+nCapTrain     = sum(idx_cap_train);
+nNonCapTrain  = sum(~idx_cap_train);
+
+% Keep at most "min(nCapTrain, nNonCapTrain)" of the boundary points
+keepTrainN = min(nCapTrain, nNonCapTrain);
+if nCapTrain > 0
+    cap_inds_train    = find(idx_cap_train);
+    dsampled_cap_inds = datasample(cap_inds_train, keepTrainN, 'Replace', false);
+    finalTrain_inds   = [find(~idx_cap_train); dsampled_cap_inds];
+else
+    finalTrain_inds   = 1:length(TTTtrain_clamped);
+end
+
+% (Optional) Downsample extremes in TTTtest_clamped similarly (or not).
+idx_cap_test = (TTTtest_clamped == trainingMaxWindow | TTTtest_clamped == -trainingMaxWindow);
+nCapTest     = sum(idx_cap_test);
+nNonCapTest  = sum(~idx_cap_test);
+keepTestN    = min(nCapTest, nNonCapTest);
+
+if nCapTest > 0
+    cap_inds_test          = find(idx_cap_test);
+    dsampled_cap_inds_test = datasample(cap_inds_test, keepTestN, 'Replace', false);
+    finalTest_inds         = [find(~idx_cap_test); dsampled_cap_inds_test];
+else
+    finalTest_inds         = 1:length(TTTtest_clamped);
+end
+
+% 4) Subset features and TTT accordingly for training the NN
+Xtrain_TTT_down = Xtrain_BIS(finalTrain_inds, :);
+TTTtrain_down   = TTTtrain_clamped(finalTrain_inds);
+
+Xtest_TTT_down  = Xtest_BIS(finalTest_inds, :);
+TTTtest_down    = TTTtest_clamped(finalTest_inds);
+
+% 5) Define the feature indices for TTT model (already selected earlier)
+allExtraTTT       = (301:312)'; 
+TTT_model_features= [finalTTTfeatures; allExtraTTT];
+
+% 6) Train the feedforward neural network on the downsampled set
+hiddenLayerSizes_TTT = [100, 50, 15];
+
+Xtrain_TTT_nn = Xtrain_TTT_down(:, TTT_model_features)';
+Ytrain_TTT_nn = TTTtrain_down';   % [1 x numTrainSamples]
+
+net_TTT = fitnet(hiddenLayerSizes_TTT, 'trainscg');
+net_TTT.trainParam.showWindow = false;
+net_TTT.trainParam.epochs     = 1000;
+net_TTT.trainParam.max_fail   = 10;
+
+[net_TTT, ~] = train(net_TTT, Xtrain_TTT_nn, Ytrain_TTT_nn);
+
+% 7) Predict TTT on the *full* TRAIN set (unfiltered)
+Xtrain_TTT_nn_full = Xtrain_BIS(:, TTT_model_features)';
+predTrain_nn_full  = net_TTT(Xtrain_TTT_nn_full);
+pseudoTTT_train    = predTrain_nn_full(:);
+
+% 8) Also clamp predictions to ±(trainingMaxWindow) to be consistent
+pseudoTTT_train = max(min(pseudoTTT_train, trainingMaxWindow), -trainingMaxWindow);
+
+% 9) Predict TTT on the *full* TEST set
+Xtest_TTT_nn_full  = Xtest_BIS(:, TTT_model_features)';
+predTest_nn_full   = net_TTT(Xtest_TTT_nn_full);
+pseudoTTT_test     = predTest_nn_full(:);
+
+% 10) Clamp predicted test TTT to ±(trainingMaxWindow)
+pseudoTTT_test = max(min(pseudoTTT_test, trainingMaxWindow), -trainingMaxWindow);
+
+% 11) Evaluate performance on the entire (original) TTT range
+corrTrain_TTT = corr(pseudoTTT_train, TTTtrain_clamped);
+corrTest_TTT  = corr(pseudoTTT_test,  TTTtest_clamped);
+
+rmseTrain = sqrt(mean((pseudoTTT_train - TTTtrain_clamped).^2));
+rmseTest  = sqrt(mean((pseudoTTT_test  - TTTtest_clamped).^2));
+maeTrain  = mean(abs(pseudoTTT_train - TTTtrain_clamped));
+maeTest   = mean(abs(pseudoTTT_test  - TTTtest_clamped));
+
+fprintf('Fold %d TTT => Corr(Train)=%.2f, RMSE(Train)=%.2f, MAE(Train)=%.2f\n',...
+    fold, corrTrain_TTT, rmseTrain, maeTrain);
+fprintf('Fold %d TTT => Corr(Test)=%.2f,  RMSE(Test)=%.2f,  MAE(Test)=%.2f\n',...
+    fold, corrTest_TTT, rmseTest, maeTest);
+
+% 12) Evaluate “in‐region” performance (±15) using the original TTT
+inRegionIdx = find(abs(TTTtest_orig) < max_windows);
+if ~isempty(inRegionIdx)
+    corrTest_inRegion = corr(pseudoTTT_test(inRegionIdx), TTTtest_orig(inRegionIdx));
+    rmseTest_inRegion = sqrt(mean((pseudoTTT_test(inRegionIdx) - TTTtest_orig(inRegionIdx)).^2));
+    maeTest_inRegion  = mean(abs(pseudoTTT_test(inRegionIdx) - TTTtest_orig(inRegionIdx)));
+    fprintf('Fold %d TTT (In-Region ±%d) => Corr=%.2f, RMSE=%.2f, MAE=%.2f\n',...
+        fold, max_windows, corrTest_inRegion, rmseTest_inRegion, maeTest_inRegion);
+else
+    corrTest_inRegion = NaN;
+    rmseTest_inRegion = NaN;
+    maeTest_inRegion  = NaN;
+    fprintf('Fold %d TTT (In-Region ±%d): No test samples.\n', fold, max_windows);
+end
+
+% 13) Store or aggregate these metrics as usual
+correlation_metrics = [correlation_metrics; ...
+    corrTrain_TTT, corrTest_TTT, corrTest_inRegion, rmseTest_inRegion, maeTest_inRegion];
+
+
+
+    %% 6C) Classification (with TTT as feature)
+    Xtrain_Clf = [Xtrain_TTT, pseudoTTT_train];
+    Xtest_Clf  = [Xtest_TTT,  pseudoTTT_test];
+
+    allExtraCLF_features = (301:313)'; 
+    finalClassFeatures = [finalClassFeatures; allExtraCLF_features];
+
+    class0_idx = find(StateTrain==0);
+    class1_idx = find(StateTrain==1);
+    featsClass0 = Xtrain_Clf(class0_idx,:);
+    featsClass1 = Xtrain_Clf(class1_idx,:);
+    dsSize = round(size(featsClass0,1)*downsample_ratio);
+    dsSize = min(dsSize, size(featsClass0,1));
+    dsample_class0_idx = datasample(class0_idx, dsSize, 'Replace', false);
+    dsample_featsClass0= Xtrain_Clf(dsample_class0_idx, :);
+    num_overlap = round(dsSize*(overlap_ratio-1));
+    ensemble_models = {};
+    subset_start = 1;
+    iteration=0;
+    while subset_start <= size(dsample_featsClass0,1)
+        iteration = iteration+1;
+        subset_end = min(subset_start+num_overlap-1, size(dsample_featsClass0,1));
+        class0_sub = dsample_featsClass0(subset_start:subset_end, finalClassFeatures);
+
+        neededSyn = max(0, size(class0_sub,1) - size(featsClass1,1));
+        syn_min   = smote(featsClass1(:, finalClassFeatures), neededSyn, k_neighbors);
+
+        ensemble_feats  = [class0_sub; featsClass1(:, finalClassFeatures); syn_min];
+        ensemble_labels = [zeros(size(class0_sub,1),1);
+                           ones(size(featsClass1,1),1);
+                           ones(size(syn_min,1),1)];
+
+        sh = randperm(size(ensemble_feats,1));
+        ensemble_feats  = ensemble_feats(sh,:);
+        ensemble_labels = ensemble_labels(sh);
+
+        model_rf = TreeBagger(100, ensemble_feats, ensemble_labels, ...
+            'Method','classification', 'OOBPrediction','on', ...
+            'MinLeafSize', min_leaf_size, 'MaxNumSplits', max_num_splits);
+        ensemble_models{iteration} = model_rf;
+        subset_start = subset_end + 1;
+    end
+
+    testDataClf = Xtest_Clf(:, finalClassFeatures);
+    all_preds = zeros(size(testDataClf,1), length(ensemble_models));
+    for b = 1:length(ensemble_models)
+        pred_labels = predict(ensemble_models{b}, testDataClf);
+        all_preds(:, b) = str2double(pred_labels);
+    end
+    final_preds = mode(all_preds, 2);
+
+    confMat = confusionmat(StateTest, final_preds, 'Order',[0,1]);
+    disp(['Fold ', num2str(fold), ' Confusion Matrix (Binary):']);
+    disp(confMat);
+    clf2_confMat_sum = clf2_confMat_sum + confMat;
+
+    class_accuracy   = zeros(1,2);
+    class_precision  = zeros(1,2);
+    class_recall     = zeros(1,2);
+    class_specificity= zeros(1,2);
+    class_f1         = zeros(1,2);
+
+    for cIdx = 1:2
+        TP = confMat(cIdx,cIdx);
+        FP = sum(confMat(:,cIdx)) - TP;
+        FN = sum(confMat(cIdx,:)) - TP;
+        TN = sum(confMat(:)) - (TP+FP+FN);
+
+        if (TP+FN)>0
+            class_accuracy(cIdx) = TP/(TP+FN);
+        else
+            class_accuracy(cIdx) = NaN;
+        end
+        if (TP+FP)>0
+            class_precision(cIdx)= TP/(TP+FP);
+        else
+            class_precision(cIdx)= NaN;
+        end
+        if (TP+FN)>0
+            class_recall(cIdx)   = TP/(TP+FN);
+        else
+            class_recall(cIdx)   = NaN;
+        end
+        if (TN+FP)>0
+            class_specificity(cIdx)= TN/(TN+FP);
+        else
+            class_specificity(cIdx)= NaN;
+        end
+        prec = class_precision(cIdx);
+        rec  = class_recall(cIdx);
+        if ~(isnan(prec) || isnan(rec)) && (prec+rec)>0
+            class_f1(cIdx) = 2*(prec*rec)/(prec+rec);
+        else
+            class_f1(cIdx) = NaN;
+        end
+    end
+    overall_acc = sum(diag(confMat))/sum(confMat(:));
+    macro_prec  = nanmean(class_precision);
+    macro_rec   = nanmean(class_recall);
+    macro_spec  = nanmean(class_specificity);
+    macro_f1    = nanmean(class_f1);
+
+    fprintf('Fold %d Classification => Overall=%.2f%%, MacroPrec=%.2f%%, MacroRec=%.2f%%, MacroSpec=%.2f%%, MacroF1=%.2f%%\n',...
+        fold, overall_acc*100, macro_prec*100, macro_rec*100, macro_spec*100, macro_f1*100);
+    fprintf('   Class 0 => Acc=%.2f%%, Prec=%.2f%%, Rec=%.2f%%, Spec=%.2f%%, F1=%.2f%%\n',...
+        class_accuracy(1)*100, class_precision(1)*100, class_recall(1)*100, class_specificity(1)*100, class_f1(1)*100);
+    fprintf('   Class 1 => Acc=%.2f%%, Prec=%.2f%%, Rec=%.2f%%, Spec=%.2f%%, F1=%.2f%%\n',...
+        class_accuracy(2)*100, class_precision(2)*100, class_recall(2)*100, class_specificity(2)*100, class_f1(2)*100);
+
+    rfMetrics = [rfMetrics; ...
+        overall_acc, macro_prec, macro_rec, macro_spec, macro_f1, ...
+        class_accuracy(1), class_precision(1), class_recall(1), class_specificity(1), class_f1(1), ...
+        class_accuracy(2), class_precision(2), class_recall(2), class_specificity(2), class_f1(2)];
+
+    %%% NEW %%% - Store this fold's testSet, predictions, final_probs, etc.
+    allFolds_testSet{fold}      = testSet; 
+    allFolds_predictedBIS{fold} = predictedBIS_test;
+
+    % Probability from each ensemble
+    all_probs = zeros(size(testDataClf,1), length(ensemble_models));
+    for m = 1:length(ensemble_models)
+        [~,scores] = predict(ensemble_models{m}, testDataClf);
+        all_probs(:,m) = scores(:,2);
+    end
+    final_probs = mean(all_probs,2);
+    allFolds_finalProbs{fold}      = final_probs;
+    allFolds_ensemble_models{fold} = ensemble_models;
+
+end % end for fold=1:k
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% 8. Summary
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+fprintf('\n=== Summary ===\n');
+if ~isempty(correlation_metrics)
+    tTrainCorr       = correlation_metrics(:,1);
+    tTestCorr        = correlation_metrics(:,2);
+    tTestCorr_inReg  = correlation_metrics(:,3);
+    tTestRMSE_inReg  = correlation_metrics(:,4);
+    tTestMAE_inReg   = correlation_metrics(:,5);
+
+    fprintf('TTT: Corr(Train)=%.2f, Corr(Test)=%.2f\n',...
+        mean(tTrainCorr,'omitnan'), mean(tTestCorr,'omitnan'));
+    fprintf('     In-Region => Corr(Test)=%.2f, RMSE(Test)=%.2f, MAE(Test)=%.2f\n',...
+        mean(tTestCorr_inReg,'omitnan'), mean(tTestRMSE_inReg,'omitnan'), ...
+        mean(tTestMAE_inReg,'omitnan'));
+else
+    fprintf('No TTT metrics collected.\n');
+end
+
+if ~isempty(correlation_BIS_metrics)
+    bTrainCorr = correlation_BIS_metrics(:,1);
+    bTestCorr  = correlation_BIS_metrics(:,2);
+    bTestRMSE  = correlation_BIS_metrics(:,3);
+    bTestMAE   = correlation_BIS_metrics(:,4);
+    fprintf('BIS => Corr(Train)=%.2f, Corr(Test)=%.2f, RMSE(Test)=%.2f, MAE(Test)=%.2f\n',...
+        mean(bTrainCorr,'omitnan'), mean(bTestCorr,'omitnan'), ...
+        mean(bTestRMSE,'omitnan'), mean(bTestMAE,'omitnan'));
+else
+    fprintf('No BIS metrics collected.\n');
+end
+
+if ~isempty(correlation_futureBIS)
+    fTrainCorr = correlation_futureBIS(:,1);
+    fTestCorr  = correlation_futureBIS(:,2);
+    if size(correlation_futureBIS,2)>=6
+        fRMSEtrain = correlation_futureBIS(:,3);
+        fMAEtrain  = correlation_futureBIS(:,4);
+        fRMSEtest  = correlation_futureBIS(:,5);
+        fMAEtest   = correlation_futureBIS(:,6);
+        fprintf('Future BIS => Corr(Train)=%.2f, RMSE(Train)=%.2f, MAE(Train)=%.2f\n',...
+            mean(fTrainCorr,'omitnan'), mean(fRMSEtrain,'omitnan'), mean(fMAEtrain,'omitnan'));
+        fprintf('               Corr(Test)=%.2f,  RMSE(Test)=%.2f,  MAE(Test)=%.2f (offset=%d)\n',...
+            mean(fTestCorr,'omitnan'), mean(fRMSEtest,'omitnan'), mean(fMAEtest,'omitnan'), future_BIS_offset);
+    else
+        fprintf('Future BIS => Corr(Train)=%.2f, Corr(Test)=%.2f (offset=%d)\n',...
+            mean(fTrainCorr,'omitnan'), mean(fTestCorr,'omitnan'), future_BIS_offset);
+    end
+else
+    fprintf('No Future BIS metrics.\n');
+end
+
+if exist('region_confMat_sum','var') && ~isempty(region_confMat_sum)
+    fprintf('\n--- Multi-class Region Confusion Matrix (summed) ---\n');
+    disp(region_confMat_sum);
+end
+if exist('region_metrics_all','var') && ~isempty(region_metrics_all)
+    avgAcc = mean(region_metrics_all(:,1),'omitnan');
+    avgP   = mean(region_metrics_all(:,2),'omitnan');
+    avgR   = mean(region_metrics_all(:,3),'omitnan');
+    avgF1  = mean(region_metrics_all(:,4),'omitnan');
+    fprintf('Multi-class Region => Acc=%.2f%%, MacroPrec=%.2f%%, MacroRec=%.2f%%, MacroF1=%.2f%%\n',...
+        100*avgAcc, 100*avgP, 100*avgR, 100*avgF1);
+end
+
+if exist('rfMetrics','var') && ~isempty(rfMetrics)
+    mean_OA  = mean(rfMetrics(:,1))*100;
+    mean_MP  = mean(rfMetrics(:,2))*100;
+    mean_MR  = mean(rfMetrics(:,3))*100;
+    mean_MS  = mean(rfMetrics(:,4))*100;
+    mean_MF1 = mean(rfMetrics(:,5))*100;
+
+    c0_Acc  = mean(rfMetrics(:,6))*100;
+    c0_Prec = mean(rfMetrics(:,7))*100;
+    c0_Rec  = mean(rfMetrics(:,8))*100;
+    c0_Spec = mean(rfMetrics(:,9))*100;
+    c0_F1   = mean(rfMetrics(:,10))*100;
+
+    c1_Acc  = mean(rfMetrics(:,11))*100;
+    c1_Prec = mean(rfMetrics(:,12))*100;
+    c1_Rec  = mean(rfMetrics(:,13))*100;
+    c1_Spec = mean(rfMetrics(:,14))*100;
+    c1_F1   = mean(rfMetrics(:,15))*100;
+
+    fprintf('\n--- Binary Classification Summary ---\n');
+    fprintf('OverallAcc=%.2f%%, MacroPrec=%.2f%%, MacroRec=%.2f%%, MacroSpec=%.2f%%, MacroF1=%.2f%%\n',...
+        mean_OA, mean_MP, mean_MR, mean_MS, mean_MF1);
+    fprintf('Class 0 => Acc=%.2f%%, Prec=%.2f%%, Rec=%.2f%%, Spec=%.2f%%, F1=%.2f%%\n',...
+        c0_Acc, c0_Prec, c0_Rec, c0_Spec, c0_F1);
+    fprintf('Class 1 => Acc=%.2f%%, Prec=%.2f%%, Rec=%.2f%%, Spec=%.2f%%, F1=%.2f%%\n',...
+        c1_Acc, c1_Prec, c1_Rec, c1_Spec, c1_F1);
+    fprintf('\n--- Summed Confusion Matrix (Binary) ---\n');
+    disp(clf2_confMat_sum);
+else
+    fprintf('\nNo binary classification metrics found.\n');
+end
+
+fprintf('\n=== End of Summary ===\n');
+
+%% Example Plot: TTT (Predicted vs Actual)
+figure;
+scatter(TTTtest, pseudoTTT_test, 'b', 'filled');
+hold on;
+plot(-20:20, -20:20, 'r--', 'LineWidth', 1.5);
+xlabel('Actual Time to Target');
+ylabel('Predicted Time to Target');
+title('Predicted vs Actual Time to Target');
+legend('Predictions','Perfect Prediction','Location','Best');
+grid on;
+xlim([-15, 15]);  % X from -15..15
+ylim([-20, 20]);  % Y from -20..20
+set(gca, 'FontSize', 12);
+hold off;
+
+%% ===================== Plot Actual vs Predicted Future BIS, Probability Plots, etc. =====================
+%%% Post-loop plotting logic with plotMode
+
+switch plotMode
+    case 0
+        % Plot nothing
+        fprintf('\n[PlotMode=0] => No plots generated.\n');
+
+    case 1
+        % Plot all folds, all patients
+        fprintf('\n[PlotMode=1] => Plotting all folds, all patients.\n');
+        for f = 1:k
+            % 1) Probability Plot
+            localTestSet = allFolds_testSet{f};
+            localPredBIS = allFolds_predictedBIS{f};
+            localProbs   = allFolds_finalProbs{f};
+            if ~isempty(localTestSet) && ~isempty(localProbs)
+                uniquePIDs = unique([localTestSet.Patient_ID]);
+                for p = 1:length(uniquePIDs)
+                    pid = uniquePIDs(p);
+                    p_inds = find([localTestSet.Patient_ID] == pid);
+
+                    p_times  = [localTestSet(p_inds).Window];
+                    p_bis    = [localTestSet(p_inds).BISMedian];
+                    p_bisP   = localPredBIS(p_inds);
+                    p_prob   = localProbs(p_inds);
+                    p_states = [localTestSet(p_inds).state];
+
+                    [p_times, ixS] = sort(p_times);
+                    p_bis    = p_bis(ixS);
+                    p_bisP   = p_bisP(ixS);
+                    p_prob   = p_prob(ixS);
+                    p_states = p_states(ixS);
+
+                    figure('Name', ['Fold ', num2str(f), ', Patient ', num2str(pid)], 'Color','w');
+                    yyaxis left
+                    hold on;
+                    % BIS(Actual) => blue circles
+                    plot(p_times, p_bis, '-o', 'LineWidth', 2, 'Color','b');
+                    % BIS(Pred) => green x
+                    plot(p_times, p_bisP, '-x', 'LineWidth', 2, 'Color','g');
+                    ylabel('BIS Actual & Predicted');
+                    xlabel('Window Time');
+
+                    yyaxis right
+                    % Probability => red squares
+                    plot(p_times, p_prob, '-s', 'LineWidth', 2, 'Color','r');
+                    ylabel('Prob(Target=1)');
+                    grid on;
+                    title(['Fold ', num2str(f), ', Patient ', num2str(pid), ': BIS vs. PredBIS vs. Target Prob']);
+                    legend({'BIS','DoA-Current-GPR','P(Target=1)'}, 'Location','best');
+
+                    % If you wish to restrict to +/- max_windows around the first 'target'
+                    tIdx = find(p_states=='1',1,'first');
+                    if ~isempty(tIdx)
+                        tWin = p_times(tIdx);
+                        xline(tWin,'--k','LineWidth',2,'Label','Target','LabelOrientation','horizontal');
+                        % Uncomment below to zoom in around that target
+                         xlim([tWin - max_windows, tWin + max_windows]);
+                    end
+                    hold off;
+                end
+            end
+
+            % 2) Future BIS Plots
+            fTestSet = allFolds_futureTestSet{f};
+            fPred    = allFolds_futurePredBIS{f};
+            fLow     = allFolds_futureLower{f};
+            fUp      = allFolds_futureUpper{f};
+            if isempty(fTestSet), continue; end
+
+            offsetShift = -future_BIS_offset;
+            localPIDs = unique([fTestSet.Patient_ID]);
+            for p = 1:length(localPIDs)
+                pid = localPIDs(p);
+                pat_inds = find([fTestSet.Patient_ID] == pid);
+
+                pat_times       = [fTestSet(pat_inds).Window_future];
+                pat_BIS_current = [fTestSet(pat_inds).BISMedian];
+                pat_BISpred     = fPred(pat_inds);
+                pat_low         = fLow(pat_inds);
+                pat_up          = fUp(pat_inds);
+
+                [pat_times, idxS] = sort(pat_times);
+                pat_BIS_current = pat_BIS_current(idxS);
+                pat_BISpred     = pat_BISpred(idxS);
+                pat_low         = pat_low(idxS);
+                pat_up          = pat_up(idxS);
+
+                % Shift future BIS times
+                shifted_times_pred = pat_times + offsetShift;
+
+                validIdx = (shifted_times_pred >= 0);
+                if all(~validIdx), continue; end
+
+                pat_times       = pat_times(validIdx);
+                pat_BIS_current = pat_BIS_current(validIdx);
+                pat_BISpred     = pat_BISpred(validIdx);
+                pat_low         = pat_low(validIdx);
+                pat_up          = pat_up(validIdx);
+                shifted_times_pred= shifted_times_pred(validIdx);
+
+                figure('Name', ['Fold ', num2str(f), ', Patient ', num2str(pid), ' FUTURE BIS'], 'Color','w');
+                hold on;
+                % Actual current BIS => blue circles
+                plot(pat_times, pat_BIS_current, '-o', 'LineWidth',2, 'Color','b');
+                % Predicted future BIS => red squares
+                plot(shifted_times_pred, pat_BISpred, '-s', 'LineWidth',2, 'Color','r');
+                % Bounds => dashed red
+                plot(shifted_times_pred, pat_low, '--r', 'LineWidth',1.5);
+                plot(shifted_times_pred, pat_up,  '--r', 'LineWidth',1.5);
+
+                xlabel('Window Time');
+                ylabel('BIS');
+                legend({'Actual Current BIS','Predicted Future BIS','Lower Bound','Upper Bound'}, ...
+                    'Location','best');
+                title(['Future BIS: Fold ', num2str(f), ', Patient ', num2str(pid)]);
+                grid on;
+                hold off;
+            end
+        end
+
+    case 2
+        % Plot all patients from final fold only
+        f = k;  % final fold
+        fprintf('\n[PlotMode=2] => Plotting all patients from final fold (fold=%d).\n', f);
+
+        % 1) Probability Plot
+        localTestSet = allFolds_testSet{f};
+        localPredBIS = allFolds_predictedBIS{f};
+        localProbs   = allFolds_finalProbs{f};
+        if ~isempty(localTestSet) && ~isempty(localProbs)
+            uniquePIDs = unique([localTestSet.Patient_ID]);
+            for p = 1:length(uniquePIDs)
+                pid = uniquePIDs(p);
+                p_inds = find([localTestSet.Patient_ID] == pid);
+
+                p_times  = [localTestSet(p_inds).Window];
+                p_bis    = [localTestSet(p_inds).BISMedian];
+                p_bisP   = localPredBIS(p_inds);
+                p_prob   = localProbs(p_inds);
+                p_states = [localTestSet(p_inds).state];
+
+                [p_times, ixS] = sort(p_times);
+                p_bis    = p_bis(ixS);
+                p_bisP   = p_bisP(ixS);
+                p_prob   = p_prob(ixS);
+                p_states = p_states(ixS);
+
+                figure('Name', ['FinalFold Patient ', num2str(pid)], 'Color','w');
+                yyaxis left
+                hold on;
+                plot(p_times, p_bis,  '-o', 'LineWidth',2, 'Color','b');  % Actual BIS
+                plot(p_times, p_bisP, '-x', 'LineWidth',2, 'Color','g');  % Predicted BIS
+                ylabel('BIS Actual & Predicted');
+                xlabel('Window Time');
+
+                yyaxis right
+                plot(p_times, p_prob, '-s', 'LineWidth',2, 'Color','r');  % Probability
+                ylabel('Prob(Target=1)');
+                grid on;
+                title(['Fold ', num2str(f), ', Patient ', num2str(pid)]);
+                legend({'BIS(Actual)','BIS(Pred)','P(Target=1)'}, 'Location','best');
+
+                tIdx = find(p_states=='1',1,'first');
+                if ~isempty(tIdx)
+                    tWin = p_times(tIdx);
+                    xline(tWin,'--k','LineWidth',2,'Label','Target','LabelOrientation','horizontal');
+                    xlim([tWin - max_windows, tWin + max_windows]); % if you want domain restriction
+                end
+                hold off;
+            end
+        end
+
+        % 2) Future BIS for final fold
+        fTestSet  = allFolds_futureTestSet{f};
+        fPred     = allFolds_futurePredBIS{f};
+        fLow      = allFolds_futureLower{f};
+        fUp       = allFolds_futureUpper{f};
+        if ~isempty(fTestSet)
+            offsetShift = -future_BIS_offset;
+            localPIDs = unique([fTestSet.Patient_ID]);
+            for p = 1:length(localPIDs)
+                pid = localPIDs(p);
+                pat_inds = find([fTestSet.Patient_ID] == pid);
+
+                pat_times       = [fTestSet(pat_inds).Window_future];
+                pat_BIS_current = [fTestSet(pat_inds).BISMedian];
+                pat_BISpred     = fPred(pat_inds);
+                pat_low         = fLow(pat_inds);
+                pat_up          = fUp(pat_inds);
+
+                [pat_times, idxS] = sort(pat_times);
+                pat_BIS_current = pat_BIS_current(idxS);
+                pat_BISpred     = pat_BISpred(idxS);
+                pat_low         = pat_low(idxS);
+                pat_up          = pat_up(idxS);
+
+                shifted_times_pred = pat_times + offsetShift;
+                validIdx = (shifted_times_pred >= 0);
+                if all(~validIdx), continue; end
+
+                pat_times       = pat_times(validIdx);
+                pat_BIS_current = pat_BIS_current(validIdx);
+                pat_BISpred     = pat_BISpred(validIdx);
+                pat_low         = pat_low(validIdx);
+                pat_up          = pat_up(validIdx);
+                shifted_times_pred= shifted_times_pred(validIdx);
+
+                figure('Name',['FinalFold Future BIS, Pt ', num2str(pid)], 'Color','w');
+                hold on;
+                plot(pat_times, pat_BIS_current, '-o', 'LineWidth',2, 'Color','b');
+                plot(shifted_times_pred, pat_BISpred, '-s', 'LineWidth',2, 'Color','r');
+                plot(shifted_times_pred, pat_low, '--r', 'LineWidth',1.5);
+                plot(shifted_times_pred, pat_up,  '--r', 'LineWidth',1.5);
+
+                xlabel('Window Time');
+                ylabel('BIS');
+                legend({'Actual Current BIS','Predicted Future BIS','Lower Bound','Upper Bound'}, ...
+                    'Location','best');
+                title(['Future BIS: Fold ', num2str(f), ', Patient ', num2str(pid)]);
+                grid on;
+                hold off;
+            end
+        end
+
+    case 3
+        % Plot *all folds* but only for the selectedPatients array
+        fprintf('\n[PlotMode=3] => Plotting only selected patients, for *all folds*.\n');
+        for f = 1:k
+            fprintf('   => Fold %d:\n', f);
+
+            % Probability Plots for selected patients
+            localTestSet = allFolds_testSet{f};
+            localPredBIS = allFolds_predictedBIS{f};
+            localProbs   = allFolds_finalProbs{f};
+            if isempty(localTestSet) || isempty(localProbs), continue; end
+
+            for pid = selectedPatients
+                p_inds = find([localTestSet.Patient_ID] == pid);
+                if isempty(p_inds), continue; end
+
+                p_times  = [localTestSet(p_inds).Window];
+                p_bis    = [localTestSet(p_inds).BISMedian];
+                p_bisP   = localPredBIS(p_inds);
+                p_prob   = localProbs(p_inds);
+                p_states = [localTestSet(p_inds).state];
+
+                [p_times, ixS] = sort(p_times);
+                p_bis    = p_bis(ixS);
+                p_bisP   = p_bisP(ixS);
+                p_prob   = p_prob(ixS);
+                p_states = p_states(ixS);
+
+                figure('Name',['Fold ', num2str(f), ', Selected Pt ', num2str(pid)], 'Color','w');
+                yyaxis left
+                hold on;
+                plot(p_times, p_bis,  '-o', 'LineWidth',2, 'Color','b');  % Actual
+                plot(p_times, p_bisP, '-x', 'LineWidth',2, 'Color','g');  % Pred
+                ylabel('BIS');
+                xlabel('Window Time');
+
+                yyaxis right
+                plot(p_times, p_prob, '-s', 'LineWidth',2, 'Color','r');  % Probability
+                ylabel('Probability');
+                ylim([0 1]);
+                grid on;
+                title(['Fold ', num2str(f), ', Patient ', num2str(pid)]);
+                 legend({'BIS','DoA-Current-GPR','Probability Target'}, 'Location','best')
+
+                tIdx = find(p_states=='1',1,'first');
+                if ~isempty(tIdx)
+                    tWin = p_times(tIdx);
+                    xline(tWin,'--k','LineWidth',2,'Label','Target','LabelOrientation','horizontal');
+                    xlim([tWin - max_windows, tWin + max_windows]); % optional domain limit
+                end
+                hold off;
+            end
+
+            % Future BIS for selected patients
+ fTestSet = allFolds_futureTestSet{f};
+    fPred    = allFolds_futurePredBIS{f};
+    fLow     = allFolds_futureLower{f};
+    fUp      = allFolds_futureUpper{f};
+    if isempty(fTestSet), continue; end
+
+    offsetShift = -future_BIS_offset;
+
+    for pid = selectedPatients
+        pat_inds = find([fTestSet.Patient_ID] == pid);
+        if isempty(pat_inds), continue; end
+
+        % Extract and sort time, BIS, and predictions
+        pat_times       = [fTestSet(pat_inds).Window_future];
+        pat_BIS_current = [fTestSet(pat_inds).BISMedian];
+        pat_BISpred_future = fPred(pat_inds);
+        pat_BISpred_low    = fLow(pat_inds);
+        pat_BISpred_up     = fUp(pat_inds);
+        pat_BISpred_current = predictedBIS_test(pat_inds);  % Add this if available
+
+        % Sort by time
+        [pat_times, idxS] = sort(pat_times);
+        pat_BIS_current     = pat_BIS_current(idxS);
+        pat_BISpred_future  = pat_BISpred_future(idxS);
+        pat_BISpred_low     = pat_BISpred_low(idxS);
+        pat_BISpred_up      = pat_BISpred_up(idxS);
+        pat_BISpred_current = pat_BISpred_current(idxS);
+
+        % Apply time shift for future prediction
+        shifted_times_pred = pat_times + offsetShift;
+
+        % Filter out negative shifted times
+        validIdx = shifted_times_pred >= 0;
+        if all(~validIdx)
+            fprintf('Fold %d, Patient %d: All shifted times are negative, skipping.\n', f, pid);
+            continue;
+        end
+
+        % Keep only valid data
+        pat_times       = pat_times(validIdx);
+        pat_BIS_current = pat_BIS_current(validIdx);
+        pat_BISpred_future  = pat_BISpred_future(validIdx);
+        pat_BISpred_low     = pat_BISpred_low(validIdx);
+        pat_BISpred_up      = pat_BISpred_up(validIdx);
+        pat_BISpred_current = pat_BISpred_current(validIdx);
+        shifted_times_pred  = shifted_times_pred(validIdx);
+
+        % --- Plot ---
+        figure('Name',['Fold ', num2str(f), ' - Patient ', num2str(pid), ' FUTURE BIS'], 'Color','w');
+        hold on;
+        % Actual current BIS (blue circles)
+        plot(pat_times, pat_BIS_current, '-o', 'LineWidth', 2, 'Color', 'b');
+        % Predicted future BIS (red crosses) at shifted time
+        plot(shifted_times_pred, pat_BISpred_future, '-x', 'LineWidth', 2, 'Color', 'r');
+        % Predicted current BIS (green squares) at current time
+        plot(pat_times, pat_BISpred_current, '-s', 'LineWidth', 2, 'Color', 'g');
+        % Bounds on future BIS (red dashed)
+        plot(shifted_times_pred, pat_BISpred_low, '--r', 'LineWidth', 1.5);
+        plot(shifted_times_pred, pat_BISpred_up,  '--r', 'LineWidth', 1.5);
+
+        % Labels, title, and legend
+        legend({'BIS','DoA-Future-GPR', ...
+                'DoA-Current-GPR','Prediction Lower Bound','Prediction Upper Bound'}, ...
+               'Location','best');
+        xlabel('Period');
+        ylabel('BIS');
+        title(['Future BIS: Fold ', num2str(f), ', Patient ', num2str(pid)]);
+        grid on;
+        hold off;
+    end
+end
+
+    otherwise
+        fprintf('\nUnknown plotMode=%d => No plots.\n', plotMode);
+end
+
+
+%% HELPER FUNCTIONS (identical to user’s code except for minor additions)
+function val = getFieldOr(structVar, fieldName, defaultVal)
+    if isfield(structVar, fieldName)
+        val = structVar.(fieldName);
+    else
+        val = defaultVal;
+    end
+end
+
+function [X, BISval, TTTval, state_val] = prepareData(dataStruct, num_feats, num_bands)
+    n = length(dataStruct);
+    total_eeg_feats = num_feats * num_bands;
+    X = zeros(n, total_eeg_feats);
+    BISval    = zeros(n, 1);
+    TTTval    = zeros(n, 1);
+    state_val = zeros(n, 1);
+    for i = 1:n
+        X(i,:)       = reshape(dataStruct(i).EEG, 1, []);
+        BISval(i)    = dataStruct(i).BISMedian;
+        TTTval(i)    = dataStruct(i).time_to_target;
+        state_val(i) = str2double(dataStruct(i).state);
+    end
+end
+
+function [preselected_indices, mi_scores] = preselectFeaturesByMI(X, y, topN)
+    [numSamples, numCols] = size(X);
+    expected_total = 10 * 30;  % 10 features × 30 bands
+    if numCols ~= expected_total
+        error('X must have 300 columns (10 features x 30 bands). Found %d.', numCols);
+    end
+
+    % Compute mutual information scores
+    mi_scores = zeros(numCols, 1);
+    for c = 1:numCols
+        mi_scores(c) = compute_mutual_info(X(:, c), y);
+    end
+
+    % Select best band for each feature type (corrected layout)
+    selected = [];
+    for f = 1:10
+        start_idx = (f - 1) * 30 + 1;
+        end_idx = f * 30;
+        featureCols = start_idx:end_idx;  % This spans all bands for feature f
+        [~, localIdx] = sort(mi_scores(featureCols), 'descend');
+        bestLocal = featureCols(localIdx(1));
+        selected = [selected; bestLocal];
+    end
+
+    % Handle case where topN < 10
+    if topN < 10
+        warning('topN=%d < 10 => returning 10 columns', topN);
+        preselected_indices = selected;
+        return;
+    end
+
+    % Globally select topN features
+    [~, global_sort_idx] = sort(mi_scores, 'descend');
+    for iRank = 1:numCols
+        candidate = global_sort_idx(iRank);
+        if ~ismember(candidate, selected)
+            selected = [selected; candidate];
+            if numel(selected) == topN
+                break;
+            end
+        end
+    end
+
+    preselected_indices = selected;
+end
+
+
+function [selected_features] = performRFE(X, y, candidateFeatures, finalNum, numTrees)
+    remaining = candidateFeatures;
+    while length(remaining) > finalNum
+        rfModel = TreeBagger(numTrees, X(:, remaining), y, ...
+                             'Method','regression','OOBPredictorImportance','on');
+        importance = rfModel.OOBPermutedPredictorDeltaError;
+        [~, leastImp] = min(importance);
+        remaining(leastImp) = [];
+    end
+    selected_features = remaining;
+end
+
+function [final_features] = addRelationshipBasedFeatures(X, y, currentFeatures, numToAdd, excludeList)
+    num_features = size(X, 2);
+    relationship_scores = zeros(1, num_features);
+    for iF = 1:num_features
+        relationship_scores(iF) = compute_mutual_info(X(:, iF), y);
+    end
+    candidate_indices = setdiff(1:num_features, [currentFeatures(:); excludeList(:)]);
+    [~, sortedIdx] = sort(relationship_scores(candidate_indices), 'descend');
+    numToAdd = min(numToAdd, length(sortedIdx));
+    top_indices    = candidate_indices(sortedIdx(1:numToAdd));
+    final_features = unique([currentFeatures(:); top_indices(:)], 'stable');
+end
+
+function synthetic_samples = smote(minority_samples, num_samples_to_generate, k_neighbors)
+    num_minority = size(minority_samples,1);
+    num_features = size(minority_samples,2);
+    synthetic_samples = zeros(num_samples_to_generate, num_features);
+    if num_minority < 2
+        if num_minority == 1
+            synthetic_samples = repmat(minority_samples, num_samples_to_generate, 1);
+        end
+        return;
+    end
+    distances = pdist2(minority_samples, minority_samples);
+    for i = 1:num_samples_to_generate
+        idx = randi(num_minority);
+        [~, neigh_idx] = sort(distances(idx,:), 'ascend');
+        neighbours = neigh_idx(2:k_neighbors+1);
+        chosen_neigh = neighbours(randi(k_neighbors));
+        gap = rand(1, num_features);
+        synthetic_samples(i,:) = minority_samples(idx,:) + ...
+            gap.*(minority_samples(chosen_neigh,:) - minority_samples(idx,:));
+    end
+end
+
+function mi = compute_mutual_info(x, y)
+    Hx  = entropy_estimate(x);
+    Hy  = entropy_estimate(y);
+    Hxy = entropy_estimate([x, y]);
+    mi  = Hx + Hy - Hxy;
+end
+
+function H = entropy_estimate(data)
+    [counts, ~] = histcounts(data, 'Normalization','probability');
+    counts = counts(counts>0);
+    H = -sum(counts.*log2(counts));
+end
+
+function numLabel = regionStr2Num(strLabel)
+    uniqueLabels = ["Awake","Unconscious","Recovering"];
+    numLabel = zeros(length(strLabel),1);
+    for i = 1:length(strLabel)
+        idx = find(uniqueLabels==strLabel(i));
+        if ~isempty(idx)
+            numLabel(i) = idx;
+        else
+            numLabel(i) = 0; 
+        end
+    end
+end
+
+function F1_macro = computeMultiClassF1(confMat)
+    C = size(confMat,1);
+    f1_vals = zeros(C,1);
+    for c=1:C
+        TP = confMat(c,c);
+        FP = sum(confMat(:,c)) - TP;
+        FN = sum(confMat(c,:)) - TP;
+        if (TP+FP)==0 || (TP+FN)==0
+            f1_vals(c) = NaN;
+        else
+            prec = TP/(TP+FP);
+            rec  = TP/(TP+FN);
+            f1_vals(c) = 2*(prec*rec)/(prec+rec);
+        end
+    end
+    F1_macro = mean(f1_vals,'omitnan');
+end
+
+function [macroPrec, macroRec] = multiClassPrecRec(confMat)
+    C = size(confMat,1);
+    precVals = zeros(C,1);
+    recVals  = zeros(C,1);
+    for c = 1:C
+        TP = confMat(c,c);
+        FP = sum(confMat(:,c)) - TP;
+        FN = sum(confMat(c,:)) - TP;
+        if (TP+FP)>0
+            precVals(c) = TP/(TP+FP);
+        else
+            precVals(c)=NaN;
+        end
+        if (TP+FN)>0
+            recVals(c) = TP/(TP+FN);
+        else
+            recVals(c)=NaN;
+        end
+    end
+    macroPrec = mean(precVals,'omitnan');
+    macroRec  = mean(recVals,'omitnan');
+end
+
+function [Xshifted, BISshifted, subsetData] = shiftBISbyOffset(dataStruct, X, BIS, offset)
+    n = size(X,1);
+    if n~=length(BIS) || n~=length(dataStruct)
+        error('shiftBISbyOffset: inconsistent row counts among X,BIS,dataStruct');
+    end
+    if n<=offset
+        Xshifted   = [];
+        BISshifted = [];
+        subsetData = [];
+        return;
+    end
+    idx_end = n-offset;
+    Xshifted   = X(1:idx_end, :);
+    BISshifted = BIS((1+offset):(idx_end+offset));
+    subsetData = dataStruct(1:idx_end);
+    for i=1:idx_end
+        futureIdx = i+offset;
+        subsetData(i).BISMedian_future = dataStruct(futureIdx).BISMedian;
+        subsetData(i).Window_future    = dataStruct(futureIdx).Window;
+    end
+end
+
+function [featMatrix, featNames] = createHistoricPredBISFeatures(dataSorted, predBIS_sorted, windowDuration)
+    n = length(dataSorted);
+    featMatrix = zeros(n, 12);
+    featNames = { 'timeSinceFirstBelow60', 'timeSinceAnyBelow60', 'BIS_EMA', ...
+                  'BISmean', 'BISmin', 'BISq1', 'BISmedian', 'BISq3', 'BISmax', ...
+                  'prevPredBIS', 'deltaPredBIS', 'currPredBIS' };
+    alpha = 0.3; 
+    lastPatient = -1;
+    firstBelow60HasOccurred = false;
+    timeSinceFirst = 0;
+    timeSinceAny   = 0;
+    EMA_prev = 0;
+    sumSoFar = 0;
+    countSoFar = 0;
+    bisHistory = [];
+    prevBIS_val = NaN;
+
+    for i = 1:n
+        pID = dataSorted(i).Patient_ID;
+        if pID~=lastPatient
+            firstBelow60HasOccurred = false;
+            timeSinceFirst = 0;
+            timeSinceAny   = 0;
+            EMA_prev       = predBIS_sorted(i);
+            sumSoFar = 0;
+            countSoFar= 0;
+            bisHistory= [];
+            prevBIS_val= predBIS_sorted(i);
+            lastPatient= pID;
+        end
+        currBIS = predBIS_sorted(i);
+        if ~firstBelow60HasOccurred
+            if currBIS<60
+                firstBelow60HasOccurred=true;
+                timeSinceFirst=0;
+            else
+                timeSinceFirst= timeSinceFirst+1;
+            end
+        else
+            timeSinceFirst= timeSinceFirst+1;
+        end
+        if currBIS<60
+            timeSinceAny=0;
+        else
+            timeSinceAny= timeSinceAny+1;
+        end
+        if i==1 || pID~= dataSorted(i-1).Patient_ID
+            EMA_curr= currBIS;
+        else
+            EMA_curr= alpha*currBIS + (1-alpha)*EMA_prev;
+        end
+        sumSoFar= sumSoFar+ currBIS;
+        countSoFar= countSoFar+1;
+        meanSoFar= sumSoFar/countSoFar;
+        bisHistory(end+1)= currBIS; %#ok<AGROW>
+        sortedHist= sort(bisHistory);
+        minSoFar= sortedHist(1);
+        maxSoFar= sortedHist(end);
+        medianSoFar= median(sortedHist);
+        q1SoFar= prctile(sortedHist,25);
+        q3SoFar= prctile(sortedHist,75);
+        prevBIS= prevBIS_val;
+        deltaBIS= currBIS- prevBIS;
+
+        featMatrix(i,1)= timeSinceFirst* windowDuration;
+        featMatrix(i,2)= timeSinceAny * windowDuration;
+        featMatrix(i,3)= EMA_curr;
+        featMatrix(i,4)= meanSoFar;
+        featMatrix(i,5)= minSoFar;
+        featMatrix(i,6)= q1SoFar;
+        featMatrix(i,7)= medianSoFar;
+        featMatrix(i,8)= q3SoFar;
+        featMatrix(i,9)= maxSoFar;
+        featMatrix(i,10)= prevBIS;
+        featMatrix(i,11)= deltaBIS;
+        featMatrix(i,12)= currBIS;
+
+        EMA_prev= EMA_curr;
+        prevBIS_val= currBIS;
+    end
+end
+
+function perf = huberperf(net, t, y, e, x, perfWeights)
+%HUBERPERF Custom Huber loss performance function for a feedforward net.
+%
+%   net          - the network being trained
+%   t, y, e      - target data, output data, and errors (t - y)
+%   x            - input data
+%   perfWeights  - weights (for weighting each sample)
+%
+% The net.performParam structure can contain:
+%   net.performParam.delta (default ~1.0) 
+%   which defines the "transition" threshold between L1 and L2.
+
+% If net.performParam.delta is not set, use a default:
+if ~isfield(net.performParam, 'delta')
+    delta = 1.0;  % default
+else
+    delta = net.performParam.delta;
+end
+
+% Huber loss:
+%     L(e) = 0.5 * e^2,           if |e| <= delta
+%            delta*(|e| - 0.5*delta),  otherwise
+%
+% For vector data:
+eabs = abs(e);
+
+% Identify which elements are in quadratic region vs linear region
+isQuad = (eabs <= delta);
+isLin  = ~isQuad;
+
+huberVals = zeros(size(e));
+
+% Quadratic region (|e| <= delta)
+huberVals(isQuad) = 0.5 * ( e(isQuad) ).^2;
+
+% Linear region (|e| > delta)
+huberVals(isLin)  = delta * ( eabs(isLin) - 0.5*delta );
+
+% Weighted sum of losses
+% perfWeights is typically a matrix the same size as e (or scalar)
+if isempty(perfWeights)
+    w = 1;  
+else
+    w = perfWeights;
+end
+
+% Weighted average
+perf = sum(huberVals(:).* w(:)) / sum(w(:));
+end
+
