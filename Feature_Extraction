@@ -1,0 +1,315 @@
+%function USQ_Feature_Extraction_v2()
+% Serial feature extraction for UniSQ EEG (CH2) + BIS with strict windowing.
+% Reads : C:\Research project Backup 05072025\Research Project\BISnoinvaliddata\<pid>.mat
+% Writes: C:\Research project Backup 05072025\Research Project\TWB_Prediction_FE\<win>\TWB_Features_Patient_<pid>_Window_<win>s.mat
+%
+% Guarantees:
+%   - Exactly floor(min(floor(numel(CH2)/fs_eeg), numel(BIS_1Hz))/win) non-overlapping windows.
+%   - Half-open windowing [t0, t0+win) => no overlap, no duplication.
+%   - No forward-fill across long BIS gaps; only short NaN runs (< G sec) are filled within-segment.
+%   - Provenance saved as 'meta' with counts, durations, parameters.
+%   - Asserts fail fast if any mismatch occurs.
+
+clc;
+
+%% Paths
+addpath('C:\Research project Backup 05072025\Research Project\All_features');
+addpath('C:\Research project Backup 05072025\Research Project\BISnoinvaliddata');
+
+in_dir   = 'C:\Research project Backup 05072025\Research Project\BISnoinvaliddata';
+out_root = 'C:\Research project Backup 05072025\Research Project\TWB_Prediction_FE_V2';
+
+%% Parameters
+%window_lengths = [10 15 20 30 45 60];  % seconds
+window_lengths = [30];  % seconds
+fs_eeg = 128;                           % CH2 sampling rate (Hz)
+num_bands = 30;                         % 10 features × 30 bands expected from extractor
+GAP_FILL_MAX = 3;                       % seconds: fill NaNs only for short runs (<GAP_FILL_MAX)
+
+%% Discover numeric patient files like "37.mat"
+d = dir(fullfile(in_dir, '*.mat'));
+patient_ids = [];
+for i = 1:numel(d)
+    t = regexp(d(i).name, '^(\d+)\.mat$', 'tokens', 'once');
+    if ~isempty(t), patient_ids(end+1) = str2double(t{1}); end %#ok<AGROW>
+end
+patient_ids = sort(patient_ids);
+fprintf('Found %d patient files.\n', numel(patient_ids));
+
+%% Check feature/filter functions available
+has_feat_tls = (exist('extract_features_TLS','file') == 2);
+has_feat_std = (exist('extract_features',    'file') == 2);
+if ~(has_feat_tls || has_feat_std)
+    error('No feature extractor found on path (extract_features_TLS.m or extract_features.m).');
+end
+has_filter   = (exist('New_bandfilter_TLS',  'file') == 2);
+
+for wlen = window_lengths
+    out_dir_win = fullfile(out_root, sprintf('%d', wlen));
+    if ~exist(out_dir_win, 'dir'), mkdir(out_dir_win); end
+
+    fprintf('\n== Processing windows of %ds ==\n', wlen);
+    h = waitbar(0, sprintf('Windows=%ds | Patients 0/%d', wlen, numel(patient_ids)));
+
+    for p = 1:numel(patient_ids)
+        pid = patient_ids(p);
+        in_file = fullfile(in_dir, sprintf('%d.mat', pid));
+
+        try
+            if ~isfile(in_file)
+                fprintf(' [%3d/%3d] pid=%d missing file, skip.\n', p, numel(patient_ids), pid);
+                updateBar(h, p, numel(patient_ids), wlen); continue;
+            end
+
+            S = load(in_file);
+
+            % ==== EEG channel selection (strict) ====
+            ch2 = [];
+            if isfield(S,'CH2'),            ch2 = S.CH2;            end
+            if isempty(ch2) && isfield(S,'CH2Denoised_x'), ch2 = S.CH2Denoised_x; end
+            if isempty(ch2) && isfield(S,'x'),             ch2 = S.x;             end
+            if isempty(ch2)
+                fprintf(' [%3d/%3d] pid=%d missing CH2-like var, skip.\n', p, numel(patient_ids), pid);
+                updateBar(h, p, numel(patient_ids), wlen); continue;
+            end
+            if isrow(ch2), ch2 = ch2(:); end
+
+            % ==== BIS mandatory ====
+            if ~isfield(S,'BIS')
+                fprintf(' [%3d/%3d] pid=%d missing BIS, skip.\n', p, numel(patient_ids), pid);
+                updateBar(h, p, numel(patient_ids), wlen); continue;
+            end
+            BIS_raw = S.BIS; if isrow(BIS_raw), BIS_raw = BIS_raw(:); end
+
+            % Optional time vector
+            if isfield(S,'BIS_time'), tBIS_raw = S.BIS_time(:);
+            elseif isfield(S,'tBIS'), tBIS_raw = S.tBIS(:);
+            else,                     tBIS_raw = [];
+            end
+
+            % Optional SQI
+            if isfield(S,'SQI'), sqi = S.SQI(:); else, sqi = []; end
+
+            % ==== BIS cleaning & canonicalisation to 1 Hz (no long-gap bridging) ====
+            [BIS_1Hz, tBIS_1Hz] = canonicalise_BIS(BIS_raw, tBIS_raw, GAP_FILL_MAX);
+
+            % ==== Durations & expected windows (strict) ====
+            dur_eeg_sec = floor(numel(ch2)/fs_eeg);
+            dur_bis_sec = numel(BIS_1Hz);            % already 1 sample per second
+            total_sec   = min(dur_eeg_sec, dur_bis_sec);
+            nwin_exp    = floor(total_sec / wlen);
+            if nwin_exp < 1
+                fprintf(' [%3d/%3d] pid=%d insufficient data for %ds, skip.\n', p, numel(patient_ids), pid, wlen);
+                updateBar(h, p, numel(patient_ids), wlen); continue;
+            end
+
+            % --- durations & window count (compute first) ---
+dur_eeg_sec = floor(numel(ch2)/fs_eeg);
+dur_bis_sec = numel(BIS_1Hz);                 % 1 sample per second after canonicalisation
+total_sec   = min(dur_eeg_sec, dur_bis_sec);
+nwin        = floor(total_sec / wlen);
+if nwin < 1
+    fprintf(' [%3d/%3d] pid=%d insufficient data for %ds, skip.\n', p, numel(patient_ids), pid, wlen);
+    updateBar(h, p, numel(patient_ids), wlen);
+    continue;
+end
+
+% --- hard reset feature_data to the exact size for this patient & window ---
+feature_data = repmat(struct('Window',0, 'EEG',[], ...
+                             'BISMedian',0, 'BISMean',0, 'SQIMean',NaN), ...
+                      nwin, 1);
+
+% --- window loop uses the same nwin ---
+for w = 1:nwin
+    t0   = (w-1)*wlen;
+    i0_e = t0*fs_eeg + 1; i1_e = i0_e + wlen*fs_eeg - 1;
+    i0_b = t0 + 1;        i1_b = i0_b + wlen - 1;
+    % ... slice, filter, features, assign into feature_data(w) ...
+end
+
+% --- provenance uses the same nwin ---
+meta.expected_windows = nwin;
+meta.actual_windows   = numel(feature_data);
+
+
+            % ==== Window loop (half-open) ====
+            feature_data = repmat(struct('Window',0, 'EEG',[], ...
+                             'BISMedian',0, 'BISMean',0, 'SQIMean',NaN), ...
+                      nwin, 1);
+
+
+            feature_data(nwin_exp,1) = struct('Window', 0, 'EEG', [], ...
+                                              'BISMedian', 0, 'BISMean', 0, 'SQIMean', NaN);
+            for w = 1:nwin_exp
+                t0 = (w-1)*wlen;                 % seconds from 0
+                % EEG indices: [t0, t0+wlen) → exactly wlen*fs_eeg samples
+                i0_e = t0*fs_eeg + 1;
+                i1_e = i0_e + wlen*fs_eeg - 1;
+                % BIS indices on 1 Hz grid: [t0, t0+wlen) → exactly wlen samples
+                i0_b = t0 + 1;
+                i1_b = i0_b + wlen - 1;
+
+                % Defensive bound (should not trigger if nwin_exp is correct)
+                if i1_e > numel(ch2) || i1_b > numel(BIS_1Hz)
+                    error('Index bound exceeded (pid=%d, win=%ds, w=%d).', pid, wlen, w);
+                end
+
+                ch2_seg = ch2(i0_e:i1_e);
+                bis_seg = BIS_1Hz(i0_b:i1_b);
+
+                % Optional SQI segment aligned to BIS seconds
+                if ~isempty(sqi) && numel(sqi) >= i1_b
+                    sqi_mean = mean(sqi(i0_b:i1_b), 'omitnan');
+                else
+                    sqi_mean = NaN;
+                end
+
+                % ---- Filter EEG ----
+                if has_filter
+                    try
+                        ch2_filt = New_bandfilter_TLS(ch2_seg, fs_eeg);
+                    catch
+                        ch2_filt = New_bandfilter_TLS(ch2_seg);
+                    end
+                else
+                    % Conservative 0.5–45 Hz fallback
+                    [b,a]   = butter(4, [0.5 45]/(fs_eeg/2), 'bandpass');
+                    ch2_filt = filtfilt(b,a,ch2_seg);
+                end
+
+                % ---- Features 10 x 30 ----
+                if has_feat_tls
+                    try
+                        eeg_feats = extract_features_TLS(ch2_filt, num_bands, fs_eeg);
+                    catch
+                        eeg_feats = extract_features_TLS(ch2_filt, num_bands);
+                    end
+                else
+                    try
+                        eeg_feats = extract_features(ch2_filt, num_bands, fs_eeg);
+                    catch
+                        eeg_feats = extract_features(ch2_filt, num_bands);
+                    end
+                end
+                assert(isequal(size(eeg_feats), [10, num_bands]), ...
+                    'Feature shape must be [10 x %d], got [%d x %d] (pid=%d).', ...
+                    num_bands, size(eeg_feats,1), size(eeg_feats,2), pid);
+
+                % ---- Store ----
+                feature_data(w).Window    = w;
+                feature_data(w).EEG       = eeg_feats;
+                feature_data(w).BISMedian = median(bis_seg, 'omitnan');
+                feature_data(w).BISMean   = mean(  bis_seg, 'omitnan');
+                feature_data(w).SQIMean   = sqi_mean;
+            end
+
+            % ==== Provenance & assertions ====
+            meta = struct();
+            meta.patient_id       = pid;
+            meta.window_duration  = wlen;
+            meta.fs_eeg           = fs_eeg;
+            meta.n_eeg            = numel(ch2);
+            meta.n_bis_1Hz        = numel(BIS_1Hz);
+            meta.total_sec_used   = total_sec;
+            meta.expected_windows = nwin_exp;
+            meta.actual_windows   = numel(feature_data);
+            meta.has_filter       = logical(has_filter);
+            meta.extractor        = ternary(has_feat_tls,'extract_features_TLS','extract_features');
+
+            % Strict equality: the saved array must match expectation
+            assert(meta.actual_windows == meta.expected_windows, ...
+                'Window count mismatch (pid=%d, win=%ds): got %d, expected %d.', ...
+                pid, wlen, meta.actual_windows, meta.expected_windows);
+
+            % ==== Save per patient ====
+            save_file = fullfile(out_dir_win, ...
+                sprintf('TWB_Features_Patient_%d_Window_%ds.mat', pid, wlen));
+            save(save_file, 'feature_data', 'meta');
+
+            fprintf(' [%3d/%3d] pid=%d saved %d windows -> %s\n', ...
+                    p, numel(patient_ids), pid, meta.actual_windows, save_file);
+
+        catch ME
+            fprintf(' [%3d/%3d] pid=%d ERROR: %s\n', p, numel(patient_ids), pid, ME.message);
+        end
+
+        updateBar(h, p, numel(patient_ids), wlen);
+    end
+
+    if ishghandle(h), close(h); end
+end
+
+fprintf('\nDone (serial extraction, v2).\n');
+%end
+
+%% ======================= Helpers =======================
+
+function [BIS_1Hz, t1] = canonicalise_BIS(BIS, tBIS, GAP_FILL_MAX)
+% Clamp to [0,100]; fill only short NaN runs (< GAP_FILL_MAX sec) within-segment; no long-gap bridging.
+BIS = BIS(:);
+BIS(BIS<0 | BIS>100) = NaN;
+
+% Establish native timing
+if ~isempty(tBIS)
+    tBIS = tBIS(:);
+    % enforce monotonic
+    assert(all(diff(tBIS) > 0), 'BIS_time must be strictly increasing.');
+    fs_eff = 1/median(diff(tBIS));
+    t0 = tBIS(1); tEnd = tBIS(end);
+    t_native = tBIS;
+else
+    % assume 1 Hz native spacing if no time provided
+    fs_eff   = 1;
+    t0       = 0;
+    tEnd     = numel(BIS)-1;
+    t_native = (0:numel(BIS)-1).';
+end
+
+% Identify NaN runs and mark only short runs for filling
+isNan = isnan(BIS);
+if any(isNan)
+    d = diff([false; ~isNan; false]);
+    r0 = find(d== 1); r1 = find(d==-1)-1;
+    for rr = 1:numel(r0)
+        run_len_sec = (r1(rr)-r0(rr)+1)/fs_eff;
+        if run_len_sec >= GAP_FILL_MAX
+            % leave as NaN (long gap)
+        else
+            % fill short run locally with previous (within-run) value
+            s = r0(rr):r1(rr);
+            if r0(rr) > 1 && ~isnan(BIS(r0(rr)-1))
+                BIS(s) = BIS(r0(rr)-1);
+            end
+        end
+    end
+end
+
+% Build uniform 1 Hz grid and step-hold within observed spans (NaNs preserved)
+t1     = (ceil(t0):floor(tEnd)).';
+BIS_1Hz = interp1(t_native, BIS, t1, 'previous', NaN);
+
+% Trim outer NaNs
+valid = ~isnan(BIS_1Hz);
+if any(valid)
+    i0 = find(valid,1,'first'); i1 = find(valid,1,'last');
+    BIS_1Hz = BIS_1Hz(i0:i1);
+    t1      = t1(i0:i1) - t1(i0);  % rebase to start at 0 s
+else
+    % all invalid; return empty
+    BIS_1Hz = [];
+    t1 = [];
+end
+end
+
+function s = ternary(cond, a, b)
+if cond, s = a; else, s = b; end
+end
+
+function updateBar(h, p, P, wlen)
+try
+    if ishghandle(h)
+        waitbar(p/P, h, sprintf('Windows=%ds | Patients %d/%d', wlen, p, P));
+        drawnow limitrate;
+    end
+end
+end
